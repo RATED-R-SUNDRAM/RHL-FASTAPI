@@ -12,9 +12,8 @@ from langchain_core.messages import HumanMessage, AIMessage
 
 "LOADING ENV VARIABLE"
 load_dotenv()
-pinecone_api_key = os.getenv("PINECONE_API_KEY2")
-openai_api_key = os.getenv("OPENAI_API_KEY")
-
+pinecone_api_key = st.secrets["PINECONE_API_KEY2"]
+openai_api_key = st.secrets["OPENAI_API_KEY"]
 "LOADING EMBEDDING AND LLM"
 embedding_hf = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2", model_kwargs={"device": "cpu"})
 
