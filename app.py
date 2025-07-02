@@ -39,7 +39,7 @@ vector_store = PineconeVectorStore(index_name=index_name, embedding=embedding_hf
 
 medical_prompt = PromptTemplate(
     input_variables=["context", "question", "word_limit"],
-    template="""You are a highly factual, document-grounded AI assistant. 
+    template="""You are a highly factual, document-grounded AI assistant.
 
 Your task:
 - Use only the provided context below.
@@ -68,16 +68,19 @@ def root():
     return {"message": "RAG API is running"}
 
 @app.get("/bot/")
-def get_bot_response(query: str, word_limit: int):
+def get_bot_response(query: str, word_limit: int = 150):
+    context = get_context(query)
+
+    # Prepare final chain
     chain = (
-        RunnablePassthrough.assign(context=lambda x: get_context(x["question"]))
+        RunnablePassthrough.assign(context=lambda x: context)
         | medical_prompt
         | medical_llm
     )
 
     result = chain.invoke({
         "question": query,
-        "word_limit": word_limit
+        "word_limit": word_limit,
     })
 
     return {"response": result.content}
