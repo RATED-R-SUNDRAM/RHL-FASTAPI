@@ -6,4 +6,4 @@ langchain-pinecone
 langchain-huggingface
 pinecone-client
 python-dotenv
-sentence-transformers==2.2.2
+sentence-transformers
