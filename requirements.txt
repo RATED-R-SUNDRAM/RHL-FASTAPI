@@ -2,8 +2,8 @@ fastapi
 uvicorn[standard]
 langchain
 langchain-openai
-python-dotenv
-pinecone-client
 langchain-pinecone
-sentence-transformers==0.2.0  # older & smaller
-gunicorn
+langchain-huggingface
+pinecone
+python-dotenv
+sentence-transformers
