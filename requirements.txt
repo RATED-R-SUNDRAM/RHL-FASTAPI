@@ -4,6 +4,6 @@ langchain
 langchain-openai
 langchain-pinecone
 langchain-huggingface
-pinecone-client
+pinecone
 python-dotenv
 sentence-transformers
