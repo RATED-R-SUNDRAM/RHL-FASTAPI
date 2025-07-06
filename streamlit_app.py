@@ -10,12 +10,16 @@ import os
 import streamlit as st
 from langchain_core.messages import HumanMessage, AIMessage
 
-"LOADING ENV VARIABLE"
+# ========== ENV SETUP ==========
 load_dotenv()
 pinecone_api_key = st.secrets["PINECONE_API_KEY2"]
 openai_api_key = st.secrets["OPENAI_API_KEY"]
-"LOADING EMBEDDING AND LLM"
-embedding_hf = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2", model_kwargs={"device": "cpu"})
+
+# ========== EMBEDDINGS & LLM ==========
+embedding_hf = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2",
+    model_kwargs={"device": "cpu"}
+)
 
 medical_llm = ChatOpenAI(
     model="gpt-4o-mini",
@@ -24,6 +28,7 @@ medical_llm = ChatOpenAI(
     default_headers={"Authorization": f"Bearer {openai_api_key}"}
 )
 
+# ========== PINECONE INIT ==========
 pc = Pinecone(api_key=pinecone_api_key)
 embedding_dimension = len(embedding_hf.embed_query("test"))
 index_name = "chat-models-v1-all-minilm-l6"
@@ -36,71 +41,90 @@ if index_name not in pc.list_indexes().names():
         spec=ServerlessSpec(cloud="aws", region="us-east-1")
     )
 
-"INITIALIZING VECTOR STORE"
-vector_store = PineconeVectorStore(index_name=index_name, embedding=embedding_hf, pinecone_api_key=pinecone_api_key)
+vector_store = PineconeVectorStore(
+    index_name=index_name,
+    embedding=embedding_hf,
+    pinecone_api_key=pinecone_api_key
+)
 
+# ========== PROMPT (Claude-style grounded) ==========
 medical_prompt = PromptTemplate(
-    input_variables=["context", "question"],
-    template="""You are a helpful and knowledgeable medical assistant.
+    input_variables=["context", "chat_history", "question"],
+    template="""
+You are an AI medical assistant that responds **only using the given context**.
+Never guess, generalize, or use outside knowledge.
 
-Your task is to provide concise, factual answers based strictly on the information provided in the context below.
-
-Guidelines for Response Style:
-- Write your answer as if it’s general knowledge from a human expert, without mentioning documents, context, or sources.
-- Do not reference, quote, or mention the context or any documents in your answer.
-- Do not include phrases like “Based on the context…” or “The document states…”.
-- Summarize, paraphrase, and explain naturally as if speaking directly to the user.
-- Stay within 150-200 words.
-- If the information needed is missing, simply respond: "The Question is out of scope of this Application."
+Instructions:
+- Only answer if the retrieved context contains enough relevant info.
+- If not, respond exactly: "The question is out of scope of this application."
+- NEVER mention the context, documents, retrieval, or sources.
+- NEVER say phrases like "based on the context..." or "from the document...".
+- Be concise, medically accurate, and direct.
+- Maximum 150 words.
+- You may include the most recent prior exchanges if relevant.
 
 Context:
 {context}
 
-User Question:
+Recent Conversation:
+{chat_history}
+
+Current User Question:
 {question}
 
 Your Answer:
-
 """
 )
 
+# ========== CONTEXT RETRIEVAL ==========
 def get_context(query):
     retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 4})
     docs = retriever.invoke(query)
     return "\n\n".join(a.page_content for a in docs)
 
-"LOADING CHATBOT"
-
-""" STREAMLIT UI """
+# ========== STREAMLIT UI ==========
 st.title("Medical Chatbot")
-st.write("Ask your medical or general questions below. ")
+st.write("Ask your medical or general questions below.")
 
-# Initialize chat history in session state
+# Session chat history
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
-# Display chat history
+# Show chat history
 for message in st.session_state.chat_history:
     with st.chat_message(message["role"]):
         st.write(message["content"])
 
-# Input field for user query
+# On new question
 if prompt := st.chat_input("Enter your query:"):
-    # Add user message to chat history
+
+    # Append current user question
     st.session_state.chat_history.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.write(prompt)
 
-    # Get response
+    # === Trim chat history to last 2 Q&A pairs (i.e. 4 messages: user, assistant, user, assistant)
+    trimmed = st.session_state.chat_history[-4:]
+    chat_str = ""
+    for m in trimmed:
+        role_prefix = "User:" if m["role"] == "user" else "Assistant:"
+        chat_str += f"{role_prefix} {m['content']}\n"
+
+    # === Build input and invoke chain ===
     context = get_context(prompt)
     chain = (
-        RunnablePassthrough.assign(context=lambda x: get_context(x["question"]))
+        RunnablePassthrough.assign(
+            context=lambda x: get_context(x["question"]),
+            chat_history=lambda x: chat_str
+        )
         | medical_prompt
         | medical_llm
     )
-    response = chain.invoke({"question": prompt})
-    
-    # Add assistant response to chat history
+    response = chain.invoke({
+        "question": prompt
+    })
+
+    # Append assistant response
     st.session_state.chat_history.append({"role": "assistant", "content": response.content})
     with st.chat_message("assistant"):
         st.write(response.content)
