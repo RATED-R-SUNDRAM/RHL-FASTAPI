@@ -72,7 +72,7 @@ def get_context(query):
 def root():
     return {"message": "RAG API is running"}
 
-@app.get("/bot/")
+@app.get("/bot/{query}")
 def get_bot_response(query: str, word_limit: int = 150):
     context = get_context(query)
 
