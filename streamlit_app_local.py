@@ -1,19 +1,17 @@
-from fastapi import FastAPI
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_pinecone import PineconeVectorStore
-from pinecone import Pinecone, ServerlessSpec
-from dotenv import load_dotenv
-from langchain_core.runnables import RunnablePassthrough
-from langchain.prompts import PromptTemplate
-from langchain_openai import ChatOpenAI
 import os
 import streamlit as st
-from langchain_core.messages import HumanMessage, AIMessage
+from dotenv import load_dotenv
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_pinecone import PineconeVectorStore
+from langchain.prompts import PromptTemplate
+from langchain_openai import ChatOpenAI
+from langchain_core.runnables import RunnablePassthrough
+from pinecone import Pinecone, ServerlessSpec
 
 # ========== ENV SETUP ==========
 load_dotenv()
-pinecone_api_key = st.secrets["PINECONE_API_KEY2"]
-openai_api_key = st.secrets["OPENAI_API_KEY"]
+pinecone_api_key = os.getenv("PINECONE_API_KEY2")
+openai_api_key = os.getenv("OPENAI_API_KEY")
 
 # ========== EMBEDDINGS & LLM ==========
 embedding_model = HuggingFaceEmbeddings(
