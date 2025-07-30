@@ -84,6 +84,7 @@ Start your answer with: **"According to <source>.pdf"**, where <source> is the f
 Do not use general knowledge or web data.
 
 Guidelines:
+-Answer as an independent bot and dont referance document in answer except the citation in the beginning
 - Be concise and medically accurate.
 - Use only retrieved chunks for the answer.
 - Word limit: 150 words.

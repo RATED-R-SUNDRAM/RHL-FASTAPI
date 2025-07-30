@@ -8,16 +8,21 @@ from langchain_openai import ChatOpenAI
 from langchain_core.runnables import RunnablePassthrough
 from pinecone import Pinecone, ServerlessSpec
 
-
+# Load environment variables
 load_dotenv()
 pinecone_api_key = os.getenv("PINECONE_API_KEY2")
 openai_api_key = os.getenv("OPENAI_API_KEY")
 
-# ========== EMBEDDINGS & LLM ==========
+# Session State Initialization (Moved to top)
+if "history" not in st.session_state:
+    st.session_state.history = []
+if "last_chunks" not in st.session_state:
+    st.session_state.last_chunks = []
+
+# Embeddings and LLM
 embedding_model = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2", model_kwargs={"device": "cpu"}
 )
-
 llm = ChatOpenAI(
     model="gpt-4o-mini",
     temperature=0.2,
@@ -25,7 +30,7 @@ llm = ChatOpenAI(
     default_headers={"Authorization": f"Bearer {openai_api_key}"}
 )
 
-# ========== PINECONE INIT ==========
+# Pinecone Initialization
 pc = Pinecone(api_key=pinecone_api_key)
 index_name = "chat-models-v1-all-minilm-l6"
 embedding_dim = len(embedding_model.embed_query("test"))
@@ -41,40 +46,33 @@ if index_name not in pc.list_indexes().names():
 vector_store = PineconeVectorStore(
     index_name=index_name, embedding=embedding_model, pinecone_api_key=pinecone_api_key
 )
+retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 6})
 
-retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 4})
-# === Chat Model ===
-llm2 = ChatOpenAI(temperature=0.2, model_name="gpt-4")
+# Medical Abbreviations
+MEDICAL_ABBRS = {
+    "IUFD": "Intrauterine fetal death",
+    "PROM": "Prelabour Rupture of Membranes"
+    # Add more as needed
+}
 
-# === Session State ===
-if "history" not in st.session_state:
-    st.session_state.history = []
-
-if "last_chunks" not in st.session_state:
-    st.session_state.last_chunks = []
-
-# === Few-shot examples for intent detection ===
+# Intent Examples
 INTENT_EXAMPLES = [
-    {"question": "What are the symptoms of depression?", "intent": "new_question"},
-    {"question": "Can you explain more?", "intent": "follow_up_chunks"},
-    {"question": "What do you mean by that?", "intent": "clarification"},
+    {"question": "What are symptoms?", "intent": "new_question"},
+    {"question": "Explain more", "intent": "follow_up"},
+    {"question": "What about diabetes?", "intent": "follow_up"},
     {"question": "Thanks!", "intent": "gratitude"},
-    {"question": "Tell me a joke", "intent": "chitchat"},
-    {"question": "What causes anxiety?", "intent": "new_question"},
-    {"question": "How does that compare to bipolar disorder?", "intent": "follow_up_reretrieve"}
+    {"question": "How are you?", "intent": "chitchat"}
 ]
 
 intent_prompt = PromptTemplate.from_template(
     """
-You are an intent classifier for a medical chatbot. Classify the user's message into one of the following:
-- new_question: Asking a fresh medical question.
-- follow_up_chunks: Wants more info based on the previous answer.
-- follow_up_reretrieve: Asks a follow-up requiring deeper search.
-- clarification: Clarifies something from the previous answer.
-- gratitude: Thanks the assistant.
-- chitchat: Casual conversation.
+You are an intent classifier for a medical chatbot. Classify the user's message into:
+- new_question: A fresh medical query.
+- follow_up: Seeks elaboration or new info based on prior context.
+- gratitude: Thanks or positive feedback.
+- chitchat: Casual talk.
 
-Output one label: new_question, follow_up_chunks, follow_up_reretrieve, clarification, gratitude, or chitchat.
+Output one label: new_question, follow_up, gratitude, or chitchat.
 
 Examples:
 {% for ex in examples %}- {{ ex.question }} → {{ ex.intent }}
@@ -84,71 +82,35 @@ User: {input}
 Intent:
 """
 )
+
 def build_intent_prompt(user_input: str, examples: list[dict]) -> str:
     formatted_examples = "\n".join([f"- {ex['question']} → {ex['intent']}" for ex in examples])
+    history = "\n".join([f"User: {q} | Bot: {a}" for q, a, _ in st.session_state.history[-2:]])
     return f"""
-You are an intent classifier for a medical chatbot. Classify the user's message into one of the following basis existing recent communication history:
-- new_question: Asking a fresh medical question.
-- follow_up_chunks: Wants more info based on the previous answer.
-- follow_up_reretrieve: Asks a follow-up requiring deeper search.
-- gratitude: Thanks the assistant.
-- chitchat: Casual conversation.
+You are an intent classifier. Classify based on recent history:
+- new_question: Fresh query.
+- follow_up: Elaboration or new info from prior context.
+- gratitude: Thanks.
+- chitchat: Casual talk.
 
-Output one label: new_question, follow_up_chunks, follow_up_reretrieve, gratitude, or chitchat.
-
-communication history:
-{st.session_state.history[:10]}
+History:
+{history}
 Examples:
 {formatted_examples}
 
 User: {user_input}
 Intent:"""
 
-
 def detect_intent(message: str) -> str:
     prompt = build_intent_prompt(message, INTENT_EXAMPLES)
-    result = llm.invoke(prompt).content.strip().lower()
-    return result
+    return llm.invoke(prompt).content.strip().lower()
 
-# === Prompt templates ===
-answer_prompt_template = PromptTemplate.from_template(
-    """
-You are a medical assistant. Only answer using the given context. If the answer is not present, reply:
-"The question is out of scope of this application."
-
-Start your answer with: **"According to <source>.pdf"**, where <source> is the file name from metadata.
-Do not use general knowledge or web data.
-
-Guidelines:
-- Be concise and medically accurate.
-- Use only retrieved chunks for the answer.
-- Word limit: 150 words.
-- Include document name (from metadata) for citation.
-
-
-Context:
-{context}
-
-Question: {question}
-Answer:
-"""
-)
-
-clarify_prompt = PromptTemplate.from_template(
-    """
-You previously answered:
-{last_answer}
-
-User follow-up:
-{question}
-
-Clarify or expand based on your last answer.
-"""
-)
-
+# Reformulation Prompt
 reformulate_prompt = PromptTemplate.from_template(
     """
-You are a helpful assistant. Given a follow-up question and the last Q&A, rewrite the follow-up into a standalone question.
+You are the main component of existence of a rag chat-bot you take in the last question and answer and a follow up question
+Basis the context of conversation and the follow up question, rewrite the question in a way that is more suite for the retreiver
+to search in documents 
 
 Previous Q&A:
 Q: {last_question}
@@ -160,75 +122,97 @@ Rewritten Question:
 """
 )
 
+# Answer Prompt
+answer_prompt_template = PromptTemplate.from_template(
+    """
+You are a medical assistant. Answer only using the given context. If the answer is not in the context, reply:
+"I apologize, but I do not have sufficient information in my documents to answer this question accurately."
+
+Start with: **"According to <source>.pdf"**, where <source> is from metadata.
+Do not use general knowledge or suggest external searches.
+
+Guidelines:
+- Be concise, medically accurate.
+- Use context to address unanswered aspects from the previous answer.
+- Consider recent chat history for coherence.
+- Word limit: 150 words.
+
+After you've answered the query assess the context retreived,recent_history and what you answered
+ and suggest relevant followup question like for eg would you like to know about...
+
+Context:
+{context}
+Previous Answer:
+{prev_answer}
+Recent History (last turn):
+{prev_history}
+
+Question: {question}
+Answer:
+"""
+)
+
 def route_intent(user_message: str):
+    # Preprocess abbreviations
+    for abbr, full_term in MEDICAL_ABBRS.items():
+        user_message = user_message.replace(abbr, full_term)
+    
     intent = detect_intent(user_message)
     history = st.session_state.history
+    last_turn = history[-1] if history else None
+    prev_question, prev_answer, _ = last_turn if last_turn else ("", "", "")
+    prev_chunks = st.session_state.last_chunks if st.session_state.last_chunks else []
 
     if intent == "new_question":
-        retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 4})
         docs = retriever.invoke(user_message)
-        chunks = []
-        for d in docs:
-            src = os.path.basename(d.metadata.get("source", ""))
-            chunks.append(f"From [{src}]: {d.page_content}")
-        context ="\n\n".join(chunks)
-        prompt = answer_prompt_template.format(context=context, question=user_message)
+        chunks = [f"From [{os.path.basename(d.metadata.get('source', ''))}.pdf]: {d.page_content}" for d in docs]
+        context = "\n\n".join(chunks[:3])  # Top 3 for brevity
+        prompt = answer_prompt_template.format(context=context, prev_answer="", prev_history="", question=user_message)
         answer = llm.invoke(prompt).content
         st.session_state.last_chunks = docs
 
-    elif intent == "follow_up_chunks":
-        chunks = st.session_state.last_chunks
-        context = "\n\n".join([doc.page_content for doc in chunks])
-        prompt = answer_prompt_template.format(context=context, question=user_message)
-        answer = llm.invoke(prompt).content
-
-    elif intent == "follow_up_reretrieve":
-        last_turns = [m for m in reversed(history) if m[2] in ["new_question", "follow_up_reretrieve"]]
-        if last_turns:
-            last_question, last_answer, _ = last_turns[0]
-            reform = reformulate_prompt.format(
-                last_question=last_question,
-                last_answer=last_answer,
-                question=user_message
-            )
-            rewritten = llm.invoke(reform).content
-            #docs = retriever.get_relevant_documents()
-            retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 4})
-            docs = retriever.invoke(rewritten)
-            chunks = []
-            for d in docs:
-                src = os.path.basename(d.metadata.get("source", ""))
-                chunks.append(f"From [{src}]: {d.page_content}")
-            context ="\n\n".join(chunks)
+    elif intent == "follow_up":
+        if last_turn and prev_chunks:
+            # Reformulate with prior context
+            reform = reformulate_prompt.format(last_question=prev_question, last_answer=prev_answer, question=user_message)
             
-            prompt = answer_prompt_template.format(context=context, question=rewritten)
+            rewritten = llm.invoke(reform).content
+            #print(rewritten)
+            # Smart retrieval: Exclude prior chunk IDs, filter out None values
+            prev_ids = [doc.metadata.get('id') for doc in prev_chunks if doc.metadata.get('id') is not None]
+            new_docs = vector_store.similarity_search(rewritten, k=6, filter={"id": {"$nin": prev_ids}} if prev_ids else {})            
+            new_chunks = [f"From [{os.path.basename(d.metadata.get('source', ''))}.pdf]: {d.page_content}" for d in new_docs]
+            
+            # Combine context: 3 new + 1 past (if relevant)
+            combined_context = "\n\n".join(new_chunks[:3] + [prev_chunks[0].page_content] if prev_chunks else new_chunks[:3])
+            
+            # Prepare history
+            prev_history = f"User: {prev_question} | Bot: {prev_answer}"
+            
+            # Prompt with fused context
+            prompt = answer_prompt_template.format(
+                context=combined_context,
+                prev_answer=prev_answer,
+                prev_history=prev_history,
+                question=rewritten
+            )
             answer = llm.invoke(prompt).content
-            st.session_state.last_chunks = docs
+            st.session_state.last_chunks = new_docs
         else:
-            answer = "Sorry, I couldn't find enough context to answer."
-
-    elif intent == "clarification":
-        last_turn = [m for m in reversed(history) if m[2] in ["new_question", "follow_up_reretrieve", "follow_up_chunks"]]
-        if last_turn:
-            last_question, last_answer, _ = last_turn[0]
-            prompt = clarify_prompt.format(last_answer=last_answer, question=user_message)
-            answer = llm.invoke(prompt).content
-        else:
-            answer = "Sorry, I need more context to clarify."
+            answer = "Sorry, I need more context to answer."
 
     elif intent == "gratitude":
-        answer = "You're welcome! Let me know if you have more questions."
+        answer = "You're welcome! Ask me anything else."
 
     elif intent == "chitchat":
-        answer = "I'm here to help with medical questions. Feel free to ask one!"
+        answer = "I'm here for medical questions. Ask one!"
 
     else:
-        answer = "Sorry, I couldn't understand that. Please rephrase."
+        answer = "Sorry, I didn't understand. Please rephrase."
 
     st.session_state.history.append((user_message, answer, intent))
     return answer
-
-# === Streamlit UI ===
+# Streamlit UI
 st.set_page_config(page_title="Medical Chatbot", layout="centered")
 st.title("🩺 Smart Medical Chatbot")
 
@@ -238,8 +222,10 @@ if user_input:
     with st.spinner("Thinking..."):
         response = route_intent(user_input)
 
-for i, (q, a, intent) in enumerate(reversed(st.session_state.history)):
-    with st.chat_message("user"):
-        st.markdown(q)
-    with st.chat_message("assistant"):
-        st.markdown(f"**({intent})**\n{a}")
+# Safely handle history display
+if st.session_state.history:
+    for i, (q, a, intent) in enumerate(reversed(st.session_state.history)):
+        with st.chat_message("user"):
+            st.markdown(q)
+        with st.chat_message("assistant"):
+            st.markdown(f"{a}")
