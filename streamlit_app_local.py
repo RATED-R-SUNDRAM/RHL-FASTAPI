@@ -44,46 +44,50 @@ vector_store = PineconeVectorStore(
 
 # ========== REWRITER ==========
 rewrite_prompt = PromptTemplate(
-    input_variables=["question", "chat_history"],
+    input_variables=["question", "chat_history", "context"],
     template="""
-You are a smart assistant. If the current question is a follow-up (like "give more info", "summarize", "what do you mean"), rewrite it using the chat history so it's fully self-contained. 
-But if it's already a complete question, return it as-is.
+You are a smart assistant. 
+Rewrite the user question only if it is a follow-up (like: "give more info", "summarize", "what do you mean") using the chat history and document context.
+If the current question makes sense on its own, return it unchanged.
 
 Chat History:
 {chat_history}
 
-Current User Question:
+Relevant Document Chunks:
+{context}
+
+User's Question:
 {question}
 
 Rewritten Query:
 """
 )
 
-def rewrite_query(question, chat_history):
+def rewrite_query(question, chat_history, context):
     history_str = ""
-    for m in chat_history[-6:]:  # last 3 Q&A pairs
+    for m in chat_history:
         prefix = "User:" if m["role"] == "user" else "Assistant:"
         history_str += f"{prefix} {m['content']}\n"
 
     chain = rewrite_prompt | llm
-    rewritten = chain.invoke({"question": question, "chat_history": history_str})
+    rewritten = chain.invoke({"question": question, "chat_history": history_str, "context": context})
     return rewritten.content.strip()
 
-# ========== PROMPT ==========
+# ========== MAIN PROMPT ==========
 main_prompt = PromptTemplate(
     input_variables=["context", "chat_history", "question"],
     template="""
-You are a medical assistant. Only answer using the given context. If the answer is not present, reply with:
+You are a medical assistant. Only answer using the given context. If the answer is not present, reply:
 "The question is out of scope of this application."
 
-Start your answer with: **"According to <source>.pdf"**, where source is the filename (from metadata).
+Start your answer with: **"According to <source>.pdf"**, where <source> is the file name from metadata.
 Do not use general knowledge or web data.
 
 Guidelines:
 - Be concise and medically accurate.
 - Use only retrieved chunks for the answer.
 - Word limit: 150 words.
-- Include file name (source) from metadata for citation.
+- Include document name (from metadata) for citation.
 
 Context:
 {context}
@@ -98,11 +102,10 @@ Answer:
 """
 )
 
-# ========== RETRIEVAL ==========
+# ========== CONTEXT RETRIEVAL ==========
 def get_context(query):
     retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 4})
     docs = retriever.invoke(query)
-
     chunks = []
     for d in docs:
         src = os.path.basename(d.metadata.get("source", ""))
@@ -111,12 +114,12 @@ def get_context(query):
 
 # ========== STREAMLIT UI ==========
 st.title("🩺 Medical Chatbot (Document-grounded)")
-st.write("Ask questions grounded in uploaded PDFs. No external info is used.")
+#st.write("Ask questions grounded in uploaded PDFs. No external info is used.")
 
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
-# Display old chat
+# Display chat
 for m in st.session_state.chat_history:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
@@ -126,16 +129,18 @@ if prompt_input := st.chat_input("Ask something..."):
     with st.chat_message("user"):
         st.markdown(prompt_input)
 
-    # === STEP 1: Rephrase if necessary ===
-    trimmed_history = st.session_state.chat_history[:-1]  # everything before current question
-    rewritten_query = rewrite_query(prompt_input, trimmed_history)
+    # Trim history to last 15 messages
+    trimmed_history = st.session_state.chat_history[-15:-1]  # exclude current message
 
-    # === STEP 2: Retrieve context ===
-    context = get_context(rewritten_query)
+    # Fetch context early so rewriter uses it too
+    context = get_context(prompt_input)
 
-    # === STEP 3: Build context-aware prompt ===
+    # Rewriting
+    rewritten_query = rewrite_query(prompt_input, trimmed_history, context)
+
+    # Build prompt
     short_history = ""
-    for m in st.session_state.chat_history[-6:]:
+    for m in trimmed_history:
         prefix = "User:" if m["role"] == "user" else "Assistant:"
         short_history += f"{prefix} {m['content']}\n"
 
@@ -147,10 +152,9 @@ if prompt_input := st.chat_input("Ask something..."):
         | main_prompt
         | llm
     )
-    result = chain.invoke({"question": prompt_input})
+    result = chain.invoke({"question": rewritten_query})
     final_response = result.content.strip()
 
-    # Save & display
     st.session_state.chat_history.append({"role": "assistant", "content": final_response})
     with st.chat_message("assistant"):
         st.markdown(final_response)

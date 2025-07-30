@@ -1,0 +1,163 @@
+from fastapi import FastAPI, Request
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_pinecone import PineconeVectorStore
+from pinecone import Pinecone, ServerlessSpec
+from dotenv import load_dotenv
+from langchain_core.runnables import RunnablePassthrough
+from langchain.prompts import PromptTemplate
+from langchain_openai import ChatOpenAI
+import sqlite3
+import os
+
+# ────────────────────────
+# 🔧 Load environment variables
+# ────────────────────────
+load_dotenv()
+pinecone_api_key = os.getenv("PINECONE_API_KEY2")
+openai_api_key = os.getenv("OPENAI_API_KEY")
+
+# ────────────────────────
+# 🚀 Initialize FastAPI App
+# ────────────────────────
+app = FastAPI()
+
+# ────────────────────────
+# 💾 SQLite Setup for Chat History
+# ────────────────────────
+DB_PATH = "chat_history.db"
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+cursor = conn.cursor()
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS chat_history (
+        user_id TEXT,
+        role TEXT,
+        message TEXT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+""")
+conn.commit()
+
+def get_chat_history(user_id: str, limit=4):
+    cursor.execute("""
+        SELECT role, message FROM chat_history
+        WHERE user_id = ?
+        ORDER BY timestamp DESC LIMIT ?
+    """, (user_id, limit))
+    rows = cursor.fetchall()[::-1]  # reverse for chronological order
+    formatted = "\n".join([f"{row[0]}: {row[1]}" for row in rows])
+    return formatted
+
+def add_to_history(user_id: str, role: str, message: str):
+    cursor.execute("""
+        INSERT INTO chat_history (user_id, role, message)
+        VALUES (?, ?, ?)
+    """, (user_id, role, message))
+    conn.commit()
+
+# ────────────────────────
+# 🔍 Embeddings & Vector Store
+# ────────────────────────
+embedding_hf = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2",
+    model_kwargs={"device": "cpu"}
+)
+medical_llm = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0.2,
+    api_key=openai_api_key,
+    default_headers={"Authorization": f"Bearer {openai_api_key}"}
+)
+pc = Pinecone(api_key=pinecone_api_key)
+index_name = "chat-models-v1-all-minilm-l6"
+embedding_dimension = len(embedding_hf.embed_query("test"))
+
+if index_name not in pc.list_indexes().names():
+    pc.create_index(
+        name=index_name,
+        metric="cosine",
+        dimension=embedding_dimension,
+        spec=ServerlessSpec(cloud="aws", region="us-east-1")
+    )
+
+vector_store = PineconeVectorStore(
+    index_name=index_name,
+    embedding=embedding_hf,
+    pinecone_api_key=pinecone_api_key
+)
+
+# ────────────────────────
+# 🧠 Prompt Template
+# ────────────────────────
+medical_prompt = PromptTemplate(
+    input_variables=["context", "chat_history", "question"],
+    template="""
+You are an AI medical assistant that responds **only using the given context**.
+Never guess, generalize, or use outside knowledge.
+
+Instructions:
+- Only answer if the retrieved context contains enough relevant info.
+- If not, respond exactly: "The question is out of scope of this application."
+- NEVER mention the context, documents, retrieval, or sources.
+- NEVER say phrases like "based on the context..." or "from the document...".
+- Be concise, medically accurate, and direct.
+- Maximum 150 words.
+- You may include the most recent prior exchanges if relevant.
+
+Context:
+{context}
+
+Recent Conversation:
+{chat_history}
+
+Current User Question:
+{question}
+
+Your Answer:
+"""
+)
+
+# ────────────────────────
+# 🔎 Context Retriever
+# ────────────────────────
+def get_context(query):
+    retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 4})
+    docs = retriever.invoke(query)
+    return "\n\n".join(a.page_content for a in docs)
+
+# ────────────────────────
+# 📡 API Endpoints
+# ────────────────────────
+@app.get("/")
+def root():
+    return {"message": "RAG API is running"}
+
+@app.get("/bot/{query}")
+def get_bot_response(query: str, request: Request):
+    user_id = request.query_params.get("user_id", "test_user")
+
+    # Retrieve recent history
+    formatted_history = get_chat_history(user_id)
+
+    # Store current user query
+    add_to_history(user_id, "User", query)
+
+    # Retrieve context
+    context = get_context(query)
+
+    # Chain the response
+    chain = (
+        RunnablePassthrough.assign(context=lambda x: context)
+        | medical_prompt
+        | medical_llm
+    )
+
+    result = chain.invoke({
+        "question": query,
+        "chat_history": formatted_history,
+    })
+
+    # Store assistant response
+    answer = result.content.strip()
+    add_to_history(user_id, "Assistant", answer)
+
+    return {"response": answer}
