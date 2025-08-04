@@ -9,8 +9,8 @@ from pinecone import Pinecone, ServerlessSpec
 
 # Load environment variables
 load_dotenv()
-pinecone_api_key = os.getenv("PINECONE_API_KEY2")
-openai_api_key = os.getenv("OPENAI_API_KEY")
+pinecone_api_key = st.secrets["PINECONE_API_KEY2"]
+openai_api_key = st.secrets["OPENAI_API_KEY"]
 
 # Session State Initialization
 if "history" not in st.session_state:
