@@ -73,8 +73,8 @@ def extract_latest_json(text: str):
 # ------------------ Init ------------------
 def initialize_components():
     load_dotenv()
-    pinecone_api_key = os.getenv("PINECONE_API_KEY2")
-    openai_api_key = os.getenv("OPENAI_API_KEY")
+    pinecone_api_key = st.secrets["PINECONE_API_KEY2"]
+    openai_api_key = st.secrets["OPENAI_API_KEY"]
 
     embedding_model = HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2",
