@@ -263,16 +263,20 @@ def medical_chatbot_pipeline(query, chat_history, retrieved_chunks, context_foll
         answer_prompt = f"""
             You are a professional medical assistant.
 
-            Constraints:
-            - Answer ONLY from <context>.
-            - Use concise bullet points (sub-bullets allowed), ~150 words max.
-            - Start with: "According to the retrieved source"
-            - Be liberal: if the context and query share the core topic, answer from context even if not the exact angle.
-            - Do not add external facts.
-
-            If <followup_context> is non-empty and contains a distinct topic not already answered,
-            END with a single sentence (no bullet):
-            "Would you like to know about <a concise follow-up topic>?"
+            Rules:
+            - Always answer ONLY from <context> provided below. 
+            - Never use the web, external sources, or prior knowledge outside the given context. 
+            - Always consider query and answer in relevance to it.
+            - Always follow below mentioned rules at all times : 
+                    • Begin each answer with: **"According to <source>"** (extract filename from metadata if available). 
+                    • Answer concisely in bullet and sub-bullet points. 
+                    • Keep under 150 words. 
+                    • Summarize meaningfully and in a perfect flow
+                    • Each bullet must be factual and context-bound. 
+                    
+            - If correction (from reformulation step) is provided, prepend it before bullets. 
+            - Respect chat history for coherence. 
+            - Always include a follow up question if <context_followup> is non-empty in the format(without bullet points) "Would you like to know about <a follow up question from context_followup not overlapping with the answer generated>?"
 
             <user_query>
             {query}
@@ -325,6 +329,7 @@ chitchat_prompt = PromptTemplate( input_variables=["conversation", "chat_history
   Conversation: {conversation}
    Chat history: {chat_history} 
   Reply: """ )
+
 
 # ------------------ Router ------------------
 def route_intent(user_message: str):
