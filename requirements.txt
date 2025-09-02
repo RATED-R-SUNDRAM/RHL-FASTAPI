@@ -7,3 +7,6 @@ langchain-huggingface
 pinecone
 python-dotenv
 sentence-transformers
+fitz
+frontend
+unstructured

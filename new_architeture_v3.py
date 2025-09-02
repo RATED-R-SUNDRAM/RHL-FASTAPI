@@ -311,8 +311,9 @@ def medical_chatbot_pipeline(query, chat_history, retrieved_chunks, context_foll
 chitchat_prompt = PromptTemplate( input_variables=["conversation", "chat_history"],
  template=""" I am your cheerful bot 😃.
   Rules: - 
-  - Always use professional words even if user has no professional words.
-  - Reply to {conversation} in a friendly, chatty yet very professional tone respond with witty, empathetic tone.
+  - Be humourous and chirpy
+  - You have no technical expertise you can just reply to {conversation} in such a way that adresses customers requests in a friendly, chatty yet very professional tone respond with witty, empathetic tone.
+  - Refraining in giving technical response reply in a formal conversation bot style and insist user to ask any medical questions
   - Refrain from answering any off-topic questions, delegate to ask users to asking about medical questions
         For eg : 
              User : how are you doing ?
@@ -385,10 +386,10 @@ def route_intent(user_message: str):
     context_answer = "\n\n".join(selected_chunks[:4])
     context_followup = "\n\n".join(selected_chunks[4:6] if len(selected_chunks) > 4 else [])
 
-    print("context_answer==========", context_answer)
+    #print("context_answer==========", context_answer)
     print()
     print()
-    print("context_followup===========", context_followup)
+    #print("context_followup===========", context_followup)
     print()
 
     answer = medical_chatbot_pipeline(rewritten,chat_history,context_answer,context_followup,llm,llm)
