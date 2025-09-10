@@ -1,417 +1,535 @@
-# app.py
 import os
 import json
 import time
-import math
-import hashlib
 import logging
 from pathlib import Path
 from dotenv import load_dotenv
-
 import streamlit as st
-from rank_bm25 import BM25Okapi
 import numpy as np
 
-# LLM / embeddings / vector DB
-from sentence_transformers import SentenceTransformer
-from pinecone import Pinecone, ServerlessSpec
 
-# Use whatever LLM client you previously used (langchain/openai wrapper).
-# Here we provide a minimal wrapper around your `llm` that supports .invoke(prompt) returning .content
-# Replace `LLMClient` implementation with your real client class.
-from langchain_openai import ChatOpenAI    # if you have this (your earlier code used it)
+from sentence_transformers import SentenceTransformer
+try:
+    from sentence_transformers import CrossEncoder
+    CROSS_ENCODER_AVAILABLE = True
+except Exception:
+    CROSS_ENCODER_AVAILABLE = False
+
+from pinecone import Pinecone, ServerlessSpec
 from langchain.prompts import PromptTemplate
 from langchain.schema import HumanMessage
+from langchain_openai import ChatOpenAI  # your existing wrapper used earlier
 
-# -------------------- Config & init --------------------
+from sentence_transformers import CrossEncoder
+
+# Load cross-encoder once
+reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+# -------------------- CONFIG --------------------
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s • %(levelname)s • %(message)s")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_KEY = os.getenv("PINECONE_API_KEY_NEW")
+INDEX_NAME = os.getenv("PINECONE_INDEX", "medical-chatbot-index")
 
 if not OPENAI_API_KEY or not PINECONE_KEY:
-    raise RuntimeError("Missing OPENAI_API_KEY or PINECONE_API_KEY_NEW in environment")
+    raise RuntimeError("OPENAI_API_KEY or PINECONE_API_KEY_NEW missing in environment")
 
-# Embedding model (local) — used for BM25 fallback and any local embedding if needed
-EMBED_MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"
-embedding_model = SentenceTransformer(EMBED_MODEL_NAME)
+
+CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"  # optional (fastish)
+
+# -------------------- MODELS & CLIENTS --------------------
+logging.info("Loading embedding model...")
+embedding_model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
 EMBED_DIM = embedding_model.get_sentence_embedding_dimension()
 
-# Pinecone client (new SDK)
+logging.info("Pinecone init...")
 pc = Pinecone(api_key=PINECONE_KEY)
-INDEX_NAME = os.getenv("PINECONE_INDEX", "medical-chatbot-index")
 if INDEX_NAME not in pc.list_indexes().names():
-    # if not present, create it (dimension must match embedding dim)
-    pc.create_index(name=INDEX_NAME, metric="cosine", dimension=EMBED_DIM, spec=ServerlessSpec(cloud="aws", region="us-east-1"))
+    logging.info("Creating Pinecone index (if needed)...")
+    pc.create_index(name=INDEX_NAME, dimension=EMBED_DIM, metric="cosine",
+                    spec=ServerlessSpec(cloud="aws", region="us-east-1"))
 index = pc.Index(INDEX_NAME)
 logging.info("Pinecone index ready.")
 
-# LLM for classification/reformulation/judge/answering
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0, api_key=OPENAI_API_KEY, default_headers={"Authorization": f"Bearer {OPENAI_API_KEY}"})
+logging.info("Initializing LLM clients...")
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0, api_key=OPENAI_API_KEY)
+chitchat_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7, api_key=OPENAI_API_KEY)
+summarizer_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0, api_key=OPENAI_API_KEY)
 
-# Local chunks file (maintain during ingestion). If missing, helper below will fetch from Pinecone once.
-CHUNKS_STORE_PATH = Path("chunks_store.jsonl")
+if CROSS_ENCODER_AVAILABLE:
+    try:
+        logging.info("Loading cross-encoder for reranking...")
+        cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL)
+    except Exception as e:
+        logging.warning("Unable to initialize CrossEncoder: %s", e)
+        CROSS_ENCODER_AVAILABLE = False
+        cross_encoder = None
+else:
+    cross_encoder = None
+    logging.info("CrossEncoder not available - falling back to vector+BM25 fusion only.")
 
-# -------------------- Helper: load local chunks for BM25 --------------------
-def load_chunks_local(path=CHUNKS_STORE_PATH):
-    if not path.exists():
-        logging.warning("Local chunks file not found. Attempting to export limited metadata from Pinecone (this may be slow).")
-        export_chunks_from_pinecone(path)
-    docs = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            docs.append(json.loads(line))
-    logging.info("Loaded %d local chunks", len(docs))
-    return docs
+# -------------------- CHAT HISTORY MANAGEMENT --------------------
+MAX_VERBATIM_PAIRS = 3  # keep last 3 Q-A pairs verbatim
+def init_session():
+    if "history_pairs" not in st.session_state:
+        st.session_state.history_pairs = []  # list[(q,a,intent)]
+    if "summary" not in st.session_state:
+        st.session_state.summary = ""
+    if "last_suggested" not in st.session_state:
+        st.session_state.last_suggested = ""
+    if "debug" not in st.session_state:
+        st.session_state.debug = []
 
-def export_chunks_from_pinecone(path_out, namespace=None, limit_per_fetch=1000):
-    """
-    Fetch metadata + text_full from Pinecone and write to local JSONL file.
-    This requires that ingestion stored full chunk text in metadata as 'text_full' (or 'text').
-    """
-    logging.info("Exporting chunks from Pinecone into %s ...", path_out)
-    # Use index.query with filter None and top_k large? Pinecone doesn't offer full scan easily; here we rely on list_vectors (may be limited).
-    # New Pinecone SDK provides index.fetch? We'll use pc.Index().fetch with ids list if you maintain ids elsewhere.
-    # As fallback, warn user to create chunks_store.jsonl at ingestion time.
-    raise RuntimeError("Local chunks file not found. Please produce `chunks_store.jsonl` at ingestion time containing each chunk as JSON with keys: id, text_full, metadata")
+def append_debug(msg):
+    logging.info(msg)
+    st.session_state.debug.append(msg)
+    # keep debug size bounded
+    if len(st.session_state.debug) > 200:
+        st.session_state.debug = st.session_state.debug[-200:]
 
-# -------------------- Build BM25 index --------------------
-def build_bm25(docs):
-    # docs: list of dicts with 'text_full' or 'text'
-    tokenized = [d.get("text_full", d.get("text", "")).split() for d in docs]
-    bm25 = BM25Okapi(tokenized)
-    return bm25
+def update_chat_history(user_message, bot_reply, intent):
+    # chitchat is NOT added to medical history
+    if intent.lower() != "chitchat":
+        st.session_state.history_pairs.append((user_message, bot_reply, intent))
+    # if we exceed MAX_VERBATIM_PAIRS, summarize older
+    if len(st.session_state.history_pairs) > MAX_VERBATIM_PAIRS:
+        # old entries to compress
+        old = st.session_state.history_pairs[:-MAX_VERBATIM_PAIRS]
+        text = "\n".join([f"User: {q} | Bot: {a}" for q, a, _ in old])
+        prompt = f"Summarize the following dialogues in one concise medical-context sentence so the bot can have context about the discussions happened so far(for future context):\n\n{text}"
+        try:
+            summary = summarizer_llm.invoke([HumanMessage(content=prompt)]).content.strip()
+        except Exception:
+            summary = ""
+        st.session_state.summary = (st.session_state.summary + " " + summary).strip()
+        st.session_state.history_pairs = st.session_state.history_pairs[-MAX_VERBATIM_PAIRS:]
 
-# -------------------- Utility: normalize metadata for Pinecone filters --------------------
-def clean_meta_for_pinecone(meta: dict):
-    safe = {}
-    for k, v in (meta or {}).items():
-        if v is None:
-            safe[k] = "unknown"
-        elif isinstance(v, (str, int, float, bool)):
-            safe[k] = v
-        elif isinstance(v, list):
-            safe[k] = [str(x) for x in v if x is not None]
-        else:
-            safe[k] = str(v)
-    return safe
+def get_chat_context():
+    verbatim = "\n".join([f"User: {q} | Bot: {a}" for q, a, _ in st.session_state.history_pairs])
+    combined = (st.session_state.summary + "\n" + verbatim).strip()
+    return combined
 
-# -------------------- Query classifier prompt (few-shot) --------------------
+# -------------------- PROMPTS (improved, few-shot + edge cases) --------------------
 classifier_prompt = PromptTemplate(
     input_variables=["chat_history", "question"],
     template="""
-You are a classifier that labels the user's message into one of three classes: MEDICAL_QUESTION, FOLLOW_UP, CHITCHAT.
+Return JSON only: {{"label":"MEDICAL_QUESTION|FOLLOW_UP|CHITCHAT,"reason":"short explanation"}}
 
-Return JSON only: {{"label":"...", "reason":"short"}}
+Guidance + few examples:
+- FOLLOW_UP: short answers to a previous assistant suggestion, e.g. assistant asked "Would you like to know about malaria prevention?" and user replies "yes" or "prevention please" -> FOLLOW_UP.
+- CHITCHAT: greetings, thanks, smalltalk, profanity, or explicit "stop" requests, anything not medical_question or follow up -> CHITCHAT.
+- MEDICAL_QUESTION: any standalone question that asks for medical facts, diagnoses, treatments, or definitions.
 
-Rules:
-- MEDICAL_QUESTION: a standalone medical question requiring factual/clinical info.
-- FOLLOW_UP: short replies (yes, sure, more details) that need chat history to form a medical question.
-- CHITCHAT: greetings, gratitude, smalltalk, profanity, non-medical requests, or asking the bot to stop.
-Use chat_history to decide if the user reply is a follow-up.
-chat_history: {chat_history}
-user_message: {question}
+Examples:
+chat_history: "Assistant: Would you like to know about jaundice?"
+question: "yes"
+-> {{"label":"FOLLOW_UP","reason":"affirmation to assistant suggestion"}}
+
+chat_history: ""
+question: "hi, how are you?"
+-> {{"label":"CHITCHAT","reason":"greeting"}}
+
+chat_history: ""
+question: "what causes jaundice?"
+-> {{"label":"MEDICAL_QUESTION","reason":"standalone medical question"}}
+
+chat_history: ""
+question: "show me bitcoin price"
+-> {{"label":"CHITCHAT","reason":"non-medical topic"}}
+
+Now classify the following:
+chat_history:
+{chat_history}
+user_message:
+{question}
 """
 )
 
-# -------------------- Reformulation prompt (few-shot, concise) --------------------
 reformulate_prompt = PromptTemplate(
-    input_variables=["chat_history", "question", "last_suggested"],
-    template="""
-Return output as JSON only: {{"Rewritten":"...","Correction":""}}
+    input_variables=["chat_history", "last_suggested", "question"],
+   template="""
+Return JSON only: with keys as "Rewritten" and "Correction" where correction being a dict of <original:corrected> pairs.
 
-You are a high-quality medical query rewriter. Use chat_history and last_suggested (if any) to rewrite the user's message into a clean, standalone medical question.
-Rules:
-- Preserve user's intent.
-- Expand abbreviations if known (e.g., IUFD -> Intrauterine fetal death).
-- If user's message is an affirmation and last_suggested is non-empty, rewrite exactly to last_suggested.
-- If user's message is clearly chitchat, append "_chitchat" to Rewritten.
-- Provide Correction only if you corrected spelling/abbr expansion; else empty.
-chat_history: {chat_history}
+
+You are a careful medical query rewriter for a clinical assistant.- Rephrase question capturing user's intent and easily searchable for a rag application 
+
+ Rules:
+
+- If user has mentioned or few words on a medical term : Rewrite it to frame a question like "Give information about <x> and cure if available"
+- If user's input is a FOLLOW_UP (additional questions, inputs about last answer) about a prior interaction, using <chat_hsitory> rewrite into a full question.
+- If input is a short affirmation (eg. "yes","sure",etc.) and last_suggested exists → rephrase follow-up question from last response into an independent standalone question . 
+- Expand common medical abbreviations where unambiguous (IUFD -> Intrauterine fetal death). If unknown, leave unchanged.
+- Only correct spelling/abbr when it changes meaning. Report such correction in Correction.
+- If input is chitchat or profanity, append "_chitchat" to Rewritten.
+- Keep rewritten concise and medically precise.
+
+Few tricky examples:
+- chat_history: "Assistant: <answer> Would you like to know about malaria prevention?"
+  question: "sure"
+  -> Rewritten: "provide details on prevention of malaria", Correction: {}
+
+- chat_history: ""
+  question: "denger sign for johndice"
+  -> Rewritten: "WHat are the danger signs for jaundice?", Correction: {"johndice":"jaundice"}
+
+- chat_history: ""
+  question: "depression"
+  -> Rewritten: "Give information about depression and cure if available", Correction: {}
+  
+- chat_history: "Assistant: Would you like to know about postpartum hemorrhage?"
+  question: "any treatment?"
+  -> Rewritten: "what are treatments for postpartum hemorrhage?", Correction: ""
+
+Now rewrite:
+chat_history:
+{chat_history}
 last_suggested: {last_suggested}
-user_message: {question}
+user_message:
+{question}
 """
 )
 
-# -------------------- Judge prompt --------------------
-judge_prompt_template = """
-You are a liberal medical relevance judge. Return JSON only:
-{{"topic_match":"strong|weak|none","sufficient":true/false,"why":"...","alternative":"<anchored question or ''>"}}
+chitchat_prompt = PromptTemplate(
+    input_variables=["conversation"],
+    template="""
+Rules: - 
+  - Be humourous and chirpy unless the user has a distres in that case give very very genric politically correct advice and let them know only for any women's health related question you can help
+  - Do not directly give out what you can and can not answer (for eg ?: dont directly msg I am not a doctor in general salutations.)
+  - You have no technical expertise you can just reply to {conversation} in such a way that adresses customers requests in a friendly, chatty yet very professional tone respond with witty, empathetic tone.
+  - Refraining in giving technical response reply in a formal conversation bot style and insist user to ask any medical questions
+  - Refrain from answering any off-topic questions, delegate to ask users to asking about medical questions
+        For eg : 
+             User : how are you doing ?
+             Bot : Answer
+             User : who is your favourite cricekter ?
+             Bot : I am just a medical bot , i'll be useful if you ask me any medical questions. 
+             User : hey bitch how are you
+             Bot : Please keep it professional. I'm here to help you with medical related query .
+             User : I want to suicide 
+             Bot : I'm sorry to hear that. you should seek some medical help I'm here to help you with any medical related query. Please let me know how I can assist you.
+  - If the user asks for medical advice, respond with a polite and professional message indicating that you are not a doctor and cannot provide medical advice.
+  
+  Conversation: {conversation}
+
+  Reply: 
+"""
+)
+
+judge_prompt = PromptTemplate(
+    input_variables=["query","context_snippet"],
+    template="""
+Return JSON only: {{"topic_match":"strong|medium|absolutely_not_possible","sufficient":true/false,"why":"short","alternative":"<anchored question or empty>"}}
 
 Guidance:
-- strong: retrieved context matches core topic.
-- weak: related angle/population but still useful.
-- none: off-topic or noise.
+- strong: Large facts about the query can be found and more supporting facts about the topic so A strong answer can be formed about the query from the context.
+- weak: very limited info directly about the query but facts round about the topic  and thus a reasonable answer can be formed 
+- none: No where near the topic or the query for eg if topic is about cure of jaundice and context is about headache symptoms, then it is none
 
-If none -> alternative must be a short medical question (6-16 words) derived from top of context.
-<query>
+sufficient is True when topic_match is strong or weak with some similarity to query or topic 
+Sufficient is False otherwise
+
+Query:
 {query}
-</query>
+
+Context (short excerpts):
+{context_snippet}
+"""
+)
+
+answer_prompt = PromptTemplate(
+    input_variables=["sources","context","context_followup","query"],
+    template="""
+You are a professional medical assistant.
+
+Rules:
+    - Always answer ONLY from <context> provided below which caters to the query. 
+    - Never use the web, external sources, or prior knowledge outside the given context. 
+    - Always consider query and answer in relevance to it.
+    - Always follow below mentioned rules at all times : 
+            • Begin each answer with: **"According to <source>"** (extract filename from metadata if available **DONT MENTION EXTENSIONS** eg, According to abc✅(correct), According to xyz.pdf❌(incorrect)). 
+            • Answer concisely in bullet and sub-bullet points. 
+            • Keep under 150 words. 
+            • Summarize meaningfully and in a perfect flow
+            • Each bullet must be factual and context-bound. 
+
+    - Respect chat history for coherence. 
+    - Always include a follow up question if <context_followup> is non-empty in the format(without bullet points) "Would you like to know about <a follow up question from context_followup not overlapping with the answer generated>?"
+
+Example :  Query : what is cure for dispesion? 
+Correction: dispersion -> depression
+Answer : I guess you meant depression 
+         According to abc : 
+          <Relevant answer from chunk >
+
+
+<user_query>
+{query}
+</user_query>
+
 <context>
 {context}
 </context>
-"""
 
-# -------------------- Answer synthesis prompt (strict rules) --------------------
-answer_prompt_template = """
-You are a highly professional medical assistant.
-
-STRICT RULES:
-1) Use ONLY the provided CONTEXT. No external knowledge.
-2) Begin answer with: "According to {sources}"
-   where {sources} are extracted document base names separated by ' and '.
-3) Answer in bullet points (no paragraphs). Max 150 words.
-4) If correction exists, put it on the first line (not counted as a bullet).
-5) If context_followup non-empty, append single-line follow-up question exactly:
-   Would you like to know about <followup question>?
-
-Context:
-{context}
-
-Followups:
+<followup_context>
 {context_followup}
+</followup_context>
 
-User query:
-{query}
+Write the final answer now.
 """
+)
 
-# -------------------- Scoring fuse function --------------------
-def fuse_scores(bm25_score, vector_score, meta_score, bm25_w=0.4, vec_w=0.5, meta_w=0.1):
-    # normalize bm25 (already ratio), assume vector_score in [-1,1] cosine -> map to [0,1]
-    vs = (vector_score + 1) / 2
-    # meta_score already in [0,1]
-    fused = bm25_w * bm25_score + vec_w * vs + meta_w * meta_score
-    return fused
-
-# -------------------- Retrieval pipeline --------------------
-def hybrid_retrieve(query, bm25, local_docs, top_k=10):
-    """
-    Returns a list of candidate chunks with fused score and metadata.
-    local_docs: list of dicts with keys: 'id','text_full','metadata'
-    bm25: trained BM25 index on tokenized texts
-    """
-    # 1) BM25 lexical scores
-    tokenized_q = query.split()
-    bm25_scores = bm25.get_scores(tokenized_q)  # array aligned to local_docs
-
-    # 2) Vector retrieval from Pinecone
-    q_emb = embedding_model.encode(query, convert_to_numpy=True).tolist()
-    vec_resp = index.query(q_emb, top_k=top_k, include_metadata=True, include_values=False)
-    # vec_resp.matches is list of matches with id, score, metadata
-    vec_matches = {m.id: m.score for m in (vec_resp.matches or [])}
-
-    # 3) Build candidate set (union of top BM25 and top vector)
-    # get top bm25 indices
-    top_bm25_idx = np.argsort(bm25_scores)[-top_k:][::-1]
-    candidate_ids = set()
-    for idx in top_bm25_idx:
-        candidate_ids.add(local_docs[idx]["id"])
-    for mid, score in vec_matches.items():
-        candidate_ids.add(mid)
-
-    # 4) compute fused score per candidate
-    candidates = []
-    # Precompute bm25 normalization (divide by max)
-    bm_max = float(np.max(bm25_scores)) if len(bm25_scores)>0 else 1.0
-    for cid in candidate_ids:
-        # find local doc
-        doc = next((d for d in local_docs if d["id"] == cid), None)
-        # if not in local docs, try fetching metadata from pinecone match list
-        if doc is None:
-            # attempt to fetch from pinecone metadata
-            fetch = index.fetch(ids=[cid], include_metadata=True)
-            meta = fetch.vectors.get(cid, {}).get("metadata", {}) if getattr(fetch, "vectors", None) else {}
-            text_full = meta.get("text_full", meta.get("text", meta.get("text_snippet", "")))
-            doc = {"id": cid, "text_full": text_full, "metadata": meta}
-        bm25_raw = 0.0
-        if doc in local_docs:
-            idx = local_docs.index(doc)
-            bm25_raw = bm25_scores[idx]
-        bm25_norm = bm25_raw / bm_max if bm_max else 0.0
-        vec_score = vec_matches.get(cid, -1.0)
-        # metadata score: boost if same section or doc_name match common tokens with query
-        meta = doc.get("metadata", {})
-        meta_score = 0.0
-        if meta.get("section") and meta.get("section").lower() in query.lower():
-            meta_score = 1.0
-        # fused
-        fused = fuse_scores(bm25_norm, vec_score, meta_score)
-        candidates.append({"id": cid, "text": doc.get("text_full"), "meta": meta, "scores": {"bm25": bm25_norm, "vec": vec_score, "meta": meta_score, "fused": fused}})
-    # sort by fused descending
-    candidates = sorted(candidates, key=lambda x: x["scores"]["fused"], reverse=True)
-    return candidates[:top_k]
-
-# -------------------- Liberal judge: uses LLM to decide sufficiency --------------------
-def judge_sufficiency(query, top_candidates, judge_llm=llm, threshold_weak=0.25):
-    """
-    top_candidates: list of candidate dicts from hybrid_retrieve
-    Returns dict with keys: sufficient(bool), topic_match, alternative (anchored)
-    We'll ask the LLM to inspect short excerpts and decide.
-    """
-    # build a compact context snippet for judge
-    cnt = 6
-    snippet = "\n\n".join([f"Source: {c['meta'].get('doc_name','unknown')}\nExcerpt: {c['text'][:400]}" for c in top_candidates[:cnt]])
-    prompt = judge_prompt_template.format(query=query, context=snippet)
-    resp = judge_llm.invoke(HumanMessage(content=prompt)).content
-    # extract last JSON
+# -------------------- HELPERS --------------------
+def safe_json_parse(text):
     try:
-        # naive: find last {...}
-        obj = json.loads(resp[resp.rfind("{"):resp.rfind("}")+1])
+        obj = json.loads(text[text.find("{"):text.rfind("}")+1])
+        return obj
     except Exception:
-        # fallback: simple heuristic: if fused score sum high enough -> true
-        avg_fused = np.mean([c["scores"]["fused"] for c in top_candidates]) if top_candidates else 0.0
-        if avg_fused > threshold_weak:
-            return {"sufficient": True, "topic_match":"weak", "alternative": ""}
-        return {"sufficient": False, "topic_match":"none", "alternative": ""}
-    return obj
+        return None
+# -------------------- HYBRID RETRIEVAL (vector -> bm25 -> cross -> fusion) --------------------
+def hybrid_retrieve(query, top_k_vec=6, u_cap=6):
+    """
+    Returns re-ranked candidate chunks using vector + BM25 + cross-encoder.
+    """
+    # 1) Vector search
+    q_emb = embedding_model.encode(query, convert_to_numpy=True).tolist()
+    vec_resp = index.query(
+        vector=q_emb,
+        top_k=top_k_vec,
+        include_metadata=True,
+        include_values=False
+    )
 
-# -------------------- Answer generator --------------------
-def synthesize_answer(query, top_candidates, context_followup, correction, main_llm=llm):
-    # Build context string and extract top source names
+    vec_matches = [{"id": m.id, "text": m.metadata.get("text_full", m.metadata.get("text_snippet", "")), "meta": m.metadata} for m in vec_resp.matches]
+
+
+    # 3) Combine & cap
+    candidates = {m["id"]: m for m in (vec_matches)}  # deduplicate
+    candidates = list(candidates.values())[:u_cap]
+
+    # 4) Re-rank with cross-encoder
+    pairs = [(query, c["text"]) for c in candidates]
+    scores = reranker.predict(pairs)
+
+    for i, c in enumerate(candidates):
+        c["scores"] = {"cross": float(scores[i])}
+
+    # Sort by cross-encoder score
+    candidates = sorted(candidates, key=lambda x: x["scores"]["cross"], reverse=True)
+    return candidates
+
+# -------------------- JUDGE + ANSWER --------------------
+def judge_sufficiency(query, candidates, judge_llm=llm, threshold_weak=0.25):
+    """
+    Judge each candidate chunk individually for sufficiency.
+    Return the top 4 qualified chunks for answering,
+    and next 2 for follow-up suggestion.
+    """
+    
+    qualified = []
+    for c in candidates[:6]:  # inspect up to 12
+        snippet = f"Source: {c['meta'].get('doc_name','unknown')}\nExcerpt: {c['text']}"
+        prompt = judge_prompt.format(query=query, context_snippet=snippet)
+
+        resp = judge_llm.invoke([HumanMessage(content=prompt)]).content
+        print(candidates, resp)
+
+        try:
+            obj = json.loads(resp[resp.rfind("{"):resp.rfind("}")+1])
+            if obj.get("sufficient", False):
+                qualified.append(c)
+        except Exception:
+            if c["scores"]["cross"] > threshold_weak:
+                qualified.append(c)
+
+    # top 4 max for answering
+    answer_chunks = qualified[:min(4, len(qualified))]
+    # next 2 max for follow-up
+    followup_chunks = qualified[4:6] if len(qualified) > 4 else candidates[len(qualified):len(qualified)+2]
+
+    return {"answer_chunks": answer_chunks, "followup_chunks": followup_chunks}
+
+def synthesize_answer(query, top_candidates, context_followup, main_llm=llm):
+    # Build context from top 3 candidates
     sources = []
     ctx_parts = []
     for c in top_candidates[:4]:
-        src = c["meta"].get("doc_name", "unknown")
+        src = c.get("meta", {}).get("doc_name", "unknown")
         if src not in sources:
             sources.append(src)
         ctx_parts.append(f"From [{src}]:\n{c['text']}")
     context = "\n\n".join(ctx_parts)
     sources_str = " and ".join([Path(s).stem for s in sources]) if sources else "unknown"
-    answer_prompt = answer_prompt_template.format(context=context, context_followup=context_followup or "", query=query)
-    # Prepend correction if exists
-    if correction:
-        answer_prompt = correction + "\n\n" + answer_prompt
-    resp = main_llm.invoke(HumanMessage(content=answer_prompt)).content
-    # ensure starts with According to ...
-    if not resp.strip().lower().startswith("according to"):
-        resp = f"According to {sources_str}\n\n{resp}"
+
+    prompt = answer_prompt.format(
+        sources=sources_str,
+        context=context,
+        context_followup=context_followup or "",
+        query=query
+    )
+    append_debug("[answer] sending synthesis prompt to LLM")
+    resp = main_llm.invoke([HumanMessage(content=prompt)]).content
+
     return resp
 
-# -------------------- Reformulate & classify wrappers --------------------
+# -------------------- CLASSIFY / REFORMULATE / CHITCHAT --------------------
 def classify_message(chat_history, user_message):
     prompt = classifier_prompt.format(chat_history=chat_history, question=user_message)
-    resp = llm.invoke(HumanMessage(content=prompt)).content
+    append_debug("[classify] sending classification prompt")
     try:
-        obj = json.loads(resp[resp.rfind("{"):resp.rfind("}")+1])
-        return obj.get("label","MEDICAL_QUESTION"), obj.get("reason","")
-    except Exception:
-        # fallback heuristics
-        if len(user_message.split()) <= 3 and user_message.lower() in ("yes","sure","ok","no","nope","nah","never mind","nevermind"):
-            return "FOLLOW_UP","short reply"
-        if any(w in user_message.lower() for w in ["hi","hello","how are you","thanks","thank you","bye"]):
-            return "CHITCHAT","greeting"
-        return "MEDICAL_QUESTION","fallback"
+        resp = llm.invoke([HumanMessage(content=prompt)]).content
+        parsed = safe_json_parse(resp)
+        if parsed:
+            return parsed.get("label", "MEDICAL_QUESTION"), parsed.get("reason", "")
+    except Exception as e:
+        append_debug(f"[classify] LLM classify failed: {e}")
 
+    # fallback heuristics
+    low = user_message.lower().strip()
+    if low in ("yes", "sure", "ok", "yep") and "Would you like to know about" in chat_history:
+        return "FOLLOW_UP", "affirmation heuristic"
+    if any(w in low for w in ("hi", "hello", "thanks", "thank you", "bye")):
+        return "CHITCHAT", "greeting heuristic"
+    return "MEDICAL_QUESTION", "fallback"
+
+# def reformulate_query(chat_history, user_message, last_suggested=""):
+#     print("here")
+#     prompt = reformulate_prompt.format(chat_history=chat_history, last_suggested=last_suggested, question=user_message)
+#     append_debug("[reformulate] sending reformulation prompt")
+#     try:
+#         resp = llm.invoke([HumanMessage(content=prompt)]).content
+#         print("resp is  ",resp)
+#         parsed = safe_json_parse(resp)
+#         if parsed:
+#             return parsed.get("Rewritten", user_message), parsed.get("Correction", "")
+#     except Exception as e:
+#         append_debug(f"[reformulate] LLM failed: {e}")
+#     return user_message, ""
 def reformulate_query(chat_history, user_message, last_suggested=""):
-    prompt = reformulate_prompt.format(chat_history=chat_history, question=user_message, last_suggested=last_suggested)
-    resp = llm.invoke(HumanMessage(content=prompt)).content
-    try:
-        obj = json.loads(resp[resp.rfind("{"):resp.rfind("}")+1])
-        return obj.get("Rewritten", user_message), obj.get("Correction","")
-    except Exception:
-        return user_message, ""
+    print("here")
+    prompt = f"""
+Return JSON only: {{"Rewritten":"...","Correction":{{"...":"..."}}}}
 
-# -------------------- Main pipeline --------------------
-def medical_pipeline(user_message, chat_history, last_suggested, local_docs, bm25):
-    # 1) profanity quick block (basic)
-    if contains_profanity(user_message):
-        return "Whoa, let’s keep it polite, please! 😊", "chitchat", None
+You are a careful medical query rewriter for a clinical assistant. Rephrase question capturing user's intent and easily searchable for a RAG application.
+
+Rules:
+- If user has mentioned or few words on a medical term: Rewrite it to frame a question like "Give information about <x> and cure if available"
+- If user's input is a FOLLOW_UP (additional questions, inputs about last answer) about a prior interaction, using chat_history rewrite into a full question.
+- If input is a short affirmation (e.g., "yes","sure",etc.) and last_suggested exists → rephrase follow-up question from last response into an independent standalone question.
+- Expand common medical abbreviations where unambiguous (IUFD -> Intrauterine fetal death). If unknown, leave unchanged.
+- Only correct spelling/abbreviations when it changes meaning. Report such correction in Correction.
+- If input is chitchat or profanity, append "_chitchat" to Rewritten.
+- Keep rewritten concise and medically precise.
+
+Few tricky examples:
+- chat_history: "Assistant: <answer> Would you like to know about malaria prevention?"
+  question: "sure"
+  -> Rewritten: "provide details on prevention of malaria", Correction: {{}}
+
+- chat_history: ""
+  question: "denger sign for johndice"
+  -> Rewritten: "What are the danger signs for jaundice?", Correction: {{"johndice":"jaundice"}}
+
+- chat_history: ""
+  question: "depression"
+  -> Rewritten: "Give information about depression and cure if available", Correction: {{}}
+  
+- chat_history: "Assistant: Would you like to know about postpartum hemorrhage?"
+  question: "any treatment?"
+  -> Rewritten: "What are treatments for postpartum hemorrhage?", Correction: {{}}
+
+Now rewrite:
+chat_history:
+{chat_history}
+last_suggested: {last_suggested}
+user_message:
+{user_message}
+"""
+    append_debug("[reformulate] sending reformulation prompt")
+    try:
+        resp = llm.invoke([HumanMessage(content=prompt)]).content
+        print("resp is ", resp)
+        parsed = safe_json_parse(resp)
+        if parsed:
+            return parsed.get("Rewritten", user_message), parsed.get("Correction", "")
+    except Exception as e:
+        append_debug(f"[reformulate] LLM failed: {e}")
+    return user_message, ""
+def handle_chitchat(user_message, chat_history):
+    prompt = chitchat_prompt.format(conversation=user_message, chat_history=chat_history)
+    append_debug("[chitchat] sending to chitchat model")
+    try:
+        return chitchat_llm.invoke([HumanMessage(content=prompt)]).content
+    except Exception as e:
+        append_debug(f"[chitchat] LLM failed: {e}")
+        return "Whoa, let’s keep it polite, please! 😊"
+
+# -------------------- MAIN PIPELINE (called by UI) --------------------
+def medical_pipeline(user_message):
+    init_session()
+    chat_history = get_chat_context()
+    append_debug(f"[pipeline] chat_history (summary+last3): {chat_history[:400]}")
 
     # 2) classify
     label, reason = classify_message(chat_history, user_message)
-    logging.info("Classifier label=%s reason=%s", label, reason)
+    append_debug(f"[pipeline] classifier -> {label} ({reason})")
 
-    if label == "CHITCHAT":
-        # build chitchat reply
-        reply = llm.invoke(HumanMessage(content=f"You are a cheerful assistant. Short friendly reply to: {user_message}")).content
-        return reply, "chitchat", None
+    # 3) reformulate (handles follow-ups, abbrs, corrections)
+    rewritten, correction = reformulate_query(chat_history, user_message, st.session_state.last_suggested or "")
+    append_debug(f"[pipeline] reformulated: {rewritten}  | correction: {correction}")
 
-    # 3) reformulate
-    rewritten, correction = reformulate_query(chat_history, user_message, last_suggested or "")
-    logging.info("Rewritten: %s | Correction: %s", rewritten, correction)
-
-    # Special-case: reformulator can mark appended "_chitchat"
     if rewritten.endswith("_chitchat"):
-        content = rewritten.replace("_chitchat", "").strip()
-        reply = llm.invoke(HumanMessage(content=f"Chitchat response to: {content}")).content
+        reply = handle_chitchat(user_message, chat_history)
+        #update_chat_history(user_message, reply, "chitchat")
         return reply, "chitchat", None
 
-    # 4) retrieval (hybrid)
-    candidates = hybrid_retrieve(rewritten, bm25, local_docs, top_k=12)
-    logging.info("Top candidate scores (fused): %s", [round(c['scores']['fused'],3) for c in candidates[:6]])
+    # 4) hybrid retrieval
+    candidates = hybrid_retrieve(rewritten)   # vector + bm25 + rerank
+    append_debug(f"[pipeline] retrieved {len(candidates)} re-ranked candidates")
 
-    # 5) judge sufficiency
     judge = judge_sufficiency(rewritten, candidates)
-    logging.info("Judge result: %s", judge)
+    append_debug(f"[pipeline] judge selected {len(judge['answer_chunks'])} answer chunks, {len(judge['followup_chunks'])} follow-up chunks")
 
-    if judge.get("sufficient"):
-        # choose top 4 to answer
-        top4 = candidates[:4]
-        # context_followup derive from next 2 candidates (simple)
-        followup_candidates = candidates[4:6] or []
+    if judge["answer_chunks"]:
+        top4 = judge["answer_chunks"]
+        followup_candidates = judge["followup_chunks"]
         followup_q = ""
         if followup_candidates:
-            # build an anchored follow-up using section title or short phrase
             fc = followup_candidates[0]
-            sec = fc["meta"].get("section") or fc["meta"].get("type") or ""
-            followup_q = sec if sec else (fc["text"][:80])
-        answer = synthesize_answer(rewritten, top4, followup_q, correction)
+            sec = fc["meta"].get("section") if fc.get("meta") else None
+            followup_q = sec or (fc["text"][:100])
+        answer = synthesize_answer(rewritten, top4, followup_q)
+        update_chat_history(user_message, answer, "answer")
+        print("label is ",label)
+        print("correction :",correction)
+        print(type(correction))
+        if label != "FOLLOW_UP":
+            answer = f"I guess you meant {'and'.join(i for i in list(corr.keys()))}" + '/n' + answer
         return answer, "answer", candidates[:6]
     else:
-        alt = judge.get("alternative","").strip()
-        if alt:
-            # store alt for next yes
-            st.session_state.last_suggested = alt
-            return f"I apologize, but I do not have sufficient information to answer this question accurately. Would you like to know about {alt} instead?", "no_context", None
-        return "I apologize, but I do not have sufficient information to answer this question accurately.", "no_context", None
+        msg = "I apologize, but I do not have sufficient information to answer this question accurately."
+        update_chat_history(user_message, msg, "no_context")
+        return msg, "no_context", None
 
-# -------------------- Profanity helper --------------------
-BAD_WORDS = ["fuck","shit","bitch","asshole","bastard","slut"]
-def contains_profanity(msg):
-    m = msg.lower()
-    return any(w in m for w in BAD_WORDS)
+# -------------------- STREAMLIT UI (example) --------------------
+st.set_page_config(page_title="Medical Chatbot — Hybrid RAG", layout="centered")
+st.title("🩺 Medical Chatbot — Hybrid (Vector + BM25 + Re-rank)")
 
-# -------------------- Streamlit UI --------------------
-st.set_page_config(page_title="Medical Chatbot (Hybrid RAG)", layout="centered")
-st.title("🩺 Medical Chatbot — Hybrid RAG")
-
-if "history" not in st.session_state:
-    st.session_state.history = []   # list of (user, assistant, intent)
-if "last_suggested" not in st.session_state:
-    st.session_state.last_suggested = ""
-
-# Load local docs & BM25 once
-if "local_docs" not in st.session_state:
-    local_docs = load_chunks_local()
-    st.session_state.local_docs = local_docs
-    st.session_state.bm25 = build_bm25(local_docs)
-else:
-    local_docs = st.session_state.local_docs
-    bm25 = st.session_state.bm25
+init_session()
+if "debug" not in st.session_state:
+    st.session_state.debug = []
 
 user_input = st.chat_input("Ask a medical question...")
 
 if user_input:
     with st.spinner("Thinking..."):
-        # Build chat_history string for LLMs (last 6 messages)
-        hist = "\n".join([f"User: {q} | Bot: {a}" for q,a,_ in st.session_state.history[-6:]])
-        bm25 = st.session_state.bm25
-        answer, intent, candidates = medical_pipeline(user_input, hist, st.session_state.last_suggested, local_docs, bm25)
-        st.session_state.history.append((user_input, answer, intent))
+        reply, intent, candidates = medical_pipeline(user_input)
+        st.session_state.history_pairs.append((user_input, reply, intent))
 
-# render history
-for q,a,intent in reversed(st.session_state.history):
+# Render chat history (verbatim last 3 + UI)
+for q, a, intent in reversed(st.session_state.history_pairs):
     with st.chat_message("user"):
         st.markdown(q)
     with st.chat_message("assistant"):
         st.markdown(a)
 
-# debugging pane
-with st.expander("Debug / Top retrieved (for last query)"):
-    cand = None
-    if st.session_state.history:
-        last_user, last_answer, last_intent = st.session_state.history[-1]
-        # Attempt to show candidates if stored in last pipeline run
-        # We used a transient store for candidates; if available, show top 6
-    st.write("To inspect retrieval, run queries and check logs. Candidate lists (id, fused) are printed in server logs.")
