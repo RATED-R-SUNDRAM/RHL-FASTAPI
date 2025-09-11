@@ -147,7 +147,7 @@ user_message:
 )
 
 reformulate_prompt = PromptTemplate(
-    input_variables=["chat_history", "last_suggested", "question"],
+    input_variables=["chat_history", "last_suggested", "question",'classifier'],
    template="""
 Return JSON only: with keys as "Rewritten" and "Correction" where correction being a dict of <original:corrected> pairs.
 
@@ -332,10 +332,11 @@ def judge_sufficiency(query, candidates, judge_llm=llm, threshold_weak=0.25):
         prompt = judge_prompt.format(query=query, context_snippet=snippet)
 
         resp = judge_llm.invoke([HumanMessage(content=prompt)]).content
-        print(candidates, resp)
+        #print(candidates, resp)
 
         try:
             obj = json.loads(resp[resp.rfind("{"):resp.rfind("}")+1])
+            print(obj)
             if obj.get("sufficient", False):
                 qualified.append(c)
         except Exception:
@@ -405,19 +406,21 @@ def classify_message(chat_history, user_message):
 #     except Exception as e:
 #         append_debug(f"[reformulate] LLM failed: {e}")
 #     return user_message, ""
-def reformulate_query(chat_history, user_message, last_suggested=""):
+def reformulate_query(chat_history, user_message,classify, last_suggested=""):
     print("here")
     prompt = f"""
 Return JSON only: {{"Rewritten":"...","Correction":{{"...":"..."}}}}
 
 You are a careful medical query rewriter for a clinical assistant. Rephrase question capturing user's intent and easily searchable for a RAG application.
-
+If label is chitchat -> return as it is no change or reformulation 
 Rules:
+- if label is chitchat -> return as it is no change or reformulation 
 - If user has mentioned or few words on a medical term: Rewrite it to frame a question like "Give information about <x> and cure if available"
 - If user's input is a FOLLOW_UP (additional questions, inputs about last answer) about a prior interaction, using chat_history rewrite into a full question.
 - If input is a short affirmation (e.g., "yes","sure",etc.) and last_suggested exists → rephrase follow-up question from last response into an independent standalone question.
 - Expand common medical abbreviations where unambiguous (IUFD -> Intrauterine fetal death). If unknown, leave unchanged.
 - Only correct spelling/abbreviations when it changes meaning. Report such correction in Correction.
+- ALso append Abbreviations in Correction
 - If input is chitchat or profanity, append "_chitchat" to Rewritten.
 - Keep rewritten concise and medically precise.
 
@@ -438,12 +441,15 @@ Few tricky examples:
   question: "any treatment?"
   -> Rewritten: "What are treatments for postpartum hemorrhage?", Correction: {{}}
 
-Now rewrite:
+classify :
+{classify}
 chat_history:
 {chat_history}
 last_suggested: {last_suggested}
 user_message:
 {user_message}
+
+NOW REWRITE or return as it is in case of chitchat :
 """
     append_debug("[reformulate] sending reformulation prompt")
     try:
@@ -475,7 +481,7 @@ def medical_pipeline(user_message):
     append_debug(f"[pipeline] classifier -> {label} ({reason})")
 
     # 3) reformulate (handles follow-ups, abbrs, corrections)
-    rewritten, correction = reformulate_query(chat_history, user_message, st.session_state.last_suggested or "")
+    rewritten, correction = reformulate_query(chat_history, user_message, st.session_state.last_suggested or "",label)
     append_debug(f"[pipeline] reformulated: {rewritten}  | correction: {correction}")
 
     if rewritten.endswith("_chitchat"):
@@ -497,14 +503,16 @@ def medical_pipeline(user_message):
         if followup_candidates:
             fc = followup_candidates[0]
             sec = fc["meta"].get("section") if fc.get("meta") else None
-            followup_q = sec or (fc["text"][:100])
+            followup_q = sec or (fc["text"])
         answer = synthesize_answer(rewritten, top4, followup_q)
         update_chat_history(user_message, answer, "answer")
         print("label is ",label)
         print("correction :",correction)
-        print(type(correction))
         if label != "FOLLOW_UP":
-            answer = f"I guess you meant {'and'.join(i for i in list(corr.keys()))}" + '/n' + answer
+            print("he")
+            if len(correction)!=0:
+                print("eheh")
+                answer = f"I guess you meant {'and'.join(i for i in list(correction.values()))}" + '\n' + answer
         return answer, "answer", candidates[:6]
     else:
         msg = "I apologize, but I do not have sufficient information to answer this question accurately."
@@ -524,7 +532,7 @@ user_input = st.chat_input("Ask a medical question...")
 if user_input:
     with st.spinner("Thinking..."):
         reply, intent, candidates = medical_pipeline(user_input)
-        st.session_state.history_pairs.append((user_input, reply, intent))
+        #st.session_state.history_pairs.append((user_input, reply, intent))
 
 # Render chat history (verbatim last 3 + UI)
 for q, a, intent in reversed(st.session_state.history_pairs):
