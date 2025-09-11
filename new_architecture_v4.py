@@ -40,34 +40,34 @@ CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"  # optional (fastis
 
 # -------------------- MODELS & CLIENTS --------------------
 logging.info("Loading embedding model...")
-embedding_model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
-EMBED_DIM = embedding_model.get_sentence_embedding_dimension()
+# embedding_model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
+# EMBED_DIM = embedding_model.get_sentence_embedding_dimension()
 
 logging.info("Pinecone init...")
-pc = Pinecone(api_key=PINECONE_KEY)
-if INDEX_NAME not in pc.list_indexes().names():
-    logging.info("Creating Pinecone index (if needed)...")
-    pc.create_index(name=INDEX_NAME, dimension=EMBED_DIM, metric="cosine",
-                    spec=ServerlessSpec(cloud="aws", region="us-east-1"))
-index = pc.Index(INDEX_NAME)
-logging.info("Pinecone index ready.")
+# pc = Pinecone(api_key=PINECONE_KEY)
+# if INDEX_NAME not in pc.list_indexes().names():
+#     logging.info("Creating Pinecone index (if needed)...")
+#     pc.create_index(name=INDEX_NAME, dimension=EMBED_DIM, metric="cosine",
+#                     spec=ServerlessSpec(cloud="aws", region="us-east-1"))
+# index = pc.Index(INDEX_NAME)
+# logging.info("Pinecone index ready.")
 
 logging.info("Initializing LLM clients...")
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0, api_key=OPENAI_API_KEY)
 chitchat_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7, api_key=OPENAI_API_KEY)
 summarizer_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0, api_key=OPENAI_API_KEY)
 
-if CROSS_ENCODER_AVAILABLE:
-    try:
-        logging.info("Loading cross-encoder for reranking...")
-        cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL)
-    except Exception as e:
-        logging.warning("Unable to initialize CrossEncoder: %s", e)
-        CROSS_ENCODER_AVAILABLE = False
-        cross_encoder = None
-else:
-    cross_encoder = None
-    logging.info("CrossEncoder not available - falling back to vector+BM25 fusion only.")
+# if CROSS_ENCODER_AVAILABLE:
+#     try:
+#         logging.info("Loading cross-encoder for reranking...")
+#         cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL)
+#     except Exception as e:
+#         logging.warning("Unable to initialize CrossEncoder: %s", e)
+#         CROSS_ENCODER_AVAILABLE = False
+#         cross_encoder = None
+# else:
+#     cross_encoder = None
+#     logging.info("CrossEncoder not available - falling back to vector+BM25 fusion only.")
 
 # -------------------- CHAT HISTORY MANAGEMENT --------------------
 MAX_VERBATIM_PAIRS = 3  # keep last 3 Q-A pairs verbatim
@@ -80,6 +80,19 @@ def init_session():
         st.session_state.last_suggested = ""
     if "debug" not in st.session_state:
         st.session_state.debug = []
+    if "pinecone_index" not in st.session_state:
+        pc = Pinecone(api_key=PINECONE_KEY)
+        index = pc.Index(INDEX_NAME)
+        st.session_state.pinecone_index = index
+
+    if "reranker" not in st.session_state:
+        cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL)
+        st.session_state.reranker = cross_encoder
+    if "embedding_model" not in st.session_state:
+        embedding_model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
+        EMBED_DIM = embedding_model.get_sentence_embedding_dimension()
+        st.session_state.embedding_model = embedding_model
+        st.session_state.EMBED_DIM= EMBED_DIM
 
 def append_debug(msg):
     logging.info(msg)
@@ -252,7 +265,7 @@ Rules:
             • Keep under 150 words. 
             • Summarize meaningfully and in a perfect flow
             • Each bullet must be factual and context-bound. 
-
+    - Answer the best answer that can be framed from the context to the query and dont mentions referance to what's not-there in the context (for eg . the document doesn't have much info about <topic> ❌ [these kind of sentence refering about the doc other than the source is not needed])
     - Respect chat history for coherence. 
     - Always include a follow up question if <context_followup> is non-empty in the format(without bullet points) "Would you like to know about <a follow up question from context_followup not overlapping with the answer generated>?"
 
@@ -287,11 +300,13 @@ def safe_json_parse(text):
     except Exception:
         return None
 # -------------------- HYBRID RETRIEVAL (vector -> bm25 -> cross -> fusion) --------------------
-def hybrid_retrieve(query, top_k_vec=6, u_cap=6):
+def hybrid_retrieve(query, top_k_vec=10, u_cap=10):
     """
     Returns re-ranked candidate chunks using vector + BM25 + cross-encoder.
     """
     # 1) Vector search
+    embedding_model = st.session_state.embedding_model
+    index = st.session_state.pinecone_index
     q_emb = embedding_model.encode(query, convert_to_numpy=True).tolist()
     vec_resp = index.query(
         vector=q_emb,
