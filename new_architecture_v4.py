@@ -102,9 +102,7 @@ def append_debug(msg):
         st.session_state.debug = st.session_state.debug[-200:]
 
 def update_chat_history(user_message, bot_reply, intent):
-    # chitchat is NOT added to medical history
-    if intent.lower() != "chitchat":
-        st.session_state.history_pairs.append((user_message, bot_reply, intent))
+    st.session_state.history_pairs.append((user_message, bot_reply, intent))
     # if we exceed MAX_VERBATIM_PAIRS, summarize older
     if len(st.session_state.history_pairs) > MAX_VERBATIM_PAIRS:
         # old entries to compress
@@ -486,55 +484,71 @@ def handle_chitchat(user_message, chat_history):
         return "Whoa, let’s keep it polite, please! 😊"
 
 # -------------------- MAIN PIPELINE (called by UI) --------------------
-def medical_pipeline(user_message):
+def medical_pipeline(user_message: str):
     init_session()
     chat_history = get_chat_context()
     append_debug(f"[pipeline] chat_history (summary+last3): {chat_history[:400]}")
 
-    # 2) classify
+    # 1) classify
     label, reason = classify_message(chat_history, user_message)
     append_debug(f"[pipeline] classifier -> {label} ({reason})")
 
-    # 3) reformulate (handles follow-ups, abbrs, corrections)
-    rewritten, correction = reformulate_query(chat_history, user_message, st.session_state.last_suggested or "",label)
+    # 2) reformulate (handles follow-ups, abbrs, corrections)
+    rewritten, correction = reformulate_query(
+        chat_history,
+        user_message,
+        st.session_state.last_suggested or "",
+        label
+    )
     append_debug(f"[pipeline] reformulated: {rewritten}  | correction: {correction}")
 
+    # ---- CHITCHAT ----
     if rewritten.endswith("_chitchat"):
         reply = handle_chitchat(user_message, chat_history)
-        #update_chat_history(user_message, reply, "chitchat")
+        update_chat_history(user_message, reply, "chitchat")
         return reply, "chitchat", None
 
-    # 4) hybrid retrieval
+    # ---- HYBRID RETRIEVAL ----
     candidates = hybrid_retrieve(rewritten)   # vector + bm25 + rerank
     append_debug(f"[pipeline] retrieved {len(candidates)} re-ranked candidates")
 
     judge = judge_sufficiency(rewritten, candidates)
-    append_debug(f"[pipeline] judge selected {len(judge['answer_chunks'])} answer chunks, {len(judge['followup_chunks'])} follow-up chunks")
+    append_debug(
+        f"[pipeline] judge selected {len(judge['answer_chunks'])} answer chunks, "
+        f"{len(judge['followup_chunks'])} follow-up chunks"
+    )
 
+    # ---- JUDGE → SYNTHESIZE ----
     if judge["answer_chunks"]:
         top4 = judge["answer_chunks"]
         followup_candidates = judge["followup_chunks"]
+
         followup_q = ""
         if followup_candidates:
             fc = followup_candidates[0]
             sec = fc["meta"].get("section") if fc.get("meta") else None
             followup_q = sec or (fc["text"])
+
         answer = synthesize_answer(rewritten, top4, followup_q)
+
+        # Apply correction prefix if needed
+        if label != "FOLLOW_UP" and correction:
+            correction_msg = "I guess you meant " + " and ".join(correction.values())
+            answer = correction_msg + "\n" + answer
+
         update_chat_history(user_message, answer, "answer")
-        print("label is ",label)
-        print("correction :",correction)
-        if label != "FOLLOW_UP":
-            print("he")
-            if len(correction)!=0:
-                print("eheh")
-                answer = f"I guess you meant {'and'.join(i for i in list(correction.values()))}" + '\n' + answer
         return answer, "answer", candidates[:6]
+
     else:
-        msg = "I apologize, but I do not have sufficient information to answer this question accurately."
+        msg = (
+            "I apologize, but I do not have sufficient information "
+            "to answer this question accurately."
+        )
         update_chat_history(user_message, msg, "no_context")
         return msg, "no_context", None
 
-# -------------------- STREAMLIT UI (example) --------------------
+
+# -------------------- STREAMLIT UI --------------------
 st.set_page_config(page_title="Medical Chatbot — Hybrid RAG", layout="centered")
 st.title("🩺 Medical Chatbot — Hybrid (Vector + BM25 + Re-rank)")
 
@@ -547,9 +561,8 @@ user_input = st.chat_input("Ask a medical question...")
 if user_input:
     with st.spinner("Thinking..."):
         reply, intent, candidates = medical_pipeline(user_input)
-        #st.session_state.history_pairs.append((user_input, reply, intent))
 
-# Render chat history (verbatim last 3 + UI)
+# Render chat history (verbatim last 3 + summary window handled internally)
 for q, a, intent in reversed(st.session_state.history_pairs):
     with st.chat_message("user"):
         st.markdown(q)
