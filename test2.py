@@ -333,7 +333,6 @@ def hybrid_retrieve(query, top_k_vec=10, u_cap=10):
     # Sort by cross-encoder score
     candidates = sorted(candidates, key=lambda x: x["scores"]["cross"], reverse=True)
     return candidates
-
 # -------------------- JUDGE + ANSWER --------------------
 def judge_sufficiency(query, candidates, judge_llm=llm, threshold_weak=0.25):
     """
@@ -343,7 +342,14 @@ def judge_sufficiency(query, candidates, judge_llm=llm, threshold_weak=0.25):
     """
     
     qualified = []
-    for c in candidates[:6]:  # inspect up to 12
+    followup_chunks=[]
+    print("len of candidates",len(candidates))
+    chunk=[]
+    judge=[]
+    topic_match=[]
+    score=[]
+    for c in candidates:  # inspect up to 12
+        print("c is ",c,type(c))
         snippet = f"Source: {c['meta'].get('doc_name','unknown')}\nExcerpt: {c['text']}"
         prompt = judge_prompt.format(query=query, context_snippet=snippet)
 
@@ -351,20 +357,32 @@ def judge_sufficiency(query, candidates, judge_llm=llm, threshold_weak=0.25):
         #print(candidates, resp)
 
         try:
+            #chunk.append(c['text'])
+
             obj = json.loads(resp[resp.rfind("{"):resp.rfind("}")+1])
+            print("obj is",obj,"type of ",type(obj))
+            judge.append(obj["sufficient"])
+            score.append(c["scores"]["cross"])
+            topic_match.append(obj["topic_match"])
             print(obj)
             if obj.get("sufficient", False):
                 qualified.append(c)
-        except Exception:
+            else:
+                followup_chunks.append(c)
+        except Exception as e:
+            print("error is ",e)
             if c["scores"]["cross"] > threshold_weak:
                 qualified.append(c)
+            else:
+                followup_chunks.append(c)
 
-    # top 4 max for answering
-    answer_chunks = qualified[:min(4, len(qualified))]
-    # next 2 max for follow-up
-    followup_chunks = qualified[4:6] if len(qualified) > 4 else candidates[len(qualified):len(qualified)+2]
-
-    return {"answer_chunks": answer_chunks, "followup_chunks": followup_chunks}
+    print("BEFORE len of answer_chunks",len(qualified),"BEFORE len of followup_chunks",len(followup_chunks))
+    if len(followup_chunks)==0:
+        followup_chunks=qualified[-2:]
+        qualified=qualified[:-2]
+    print("AFTER len of answer_chunks",len(qualified),"AFTER len of followup_chunks",len(followup_chunks))
+    df= {"judge":judge,"score":score,"topic_match":topic_match}
+    return {"answer_chunks": qualified[:4], "followup_chunks": followup_chunks[:2],"df":df}
 
 def synthesize_answer(query, top_candidates, context_followup, main_llm=llm):
     # Build context from top 3 candidates
@@ -477,6 +495,8 @@ NOW REWRITE or return as it is in case of chitchat :
     except Exception as e:
         append_debug(f"[reformulate] LLM failed: {e}")
     return user_message, ""
+
+
 def handle_chitchat(user_message, chat_history):
     prompt = chitchat_prompt.format(conversation=user_message, chat_history=chat_history)
     append_debug("[chitchat] sending to chitchat model")
@@ -510,30 +530,8 @@ def medical_pipeline(user_message):
     append_debug(f"[pipeline] retrieved {len(candidates)} re-ranked candidates")
 
     judge = judge_sufficiency(rewritten, candidates)
-    append_debug(f"[pipeline] judge selected {len(judge['answer_chunks'])} answer chunks, {len(judge['followup_chunks'])} follow-up chunks")
-
-    if judge["answer_chunks"]:
-        top4 = judge["answer_chunks"]
-        followup_candidates = judge["followup_chunks"]
-        followup_q = ""
-        if followup_candidates:
-            fc = followup_candidates[0]
-            sec = fc["meta"].get("section") if fc.get("meta") else None
-            followup_q = sec or (fc["text"])
-        answer = synthesize_answer(rewritten, top4, followup_q)
-        update_chat_history(user_message, answer, "answer")
-        print("label is ",label)
-        print("correction :",correction)
-        if label != "FOLLOW_UP":
-            print("he")
-            if len(correction)!=0:
-                print("eheh")
-                answer = f"I guess you meant {'and'.join(i for i in list(correction.values()))}" + '\n' + answer
-        return answer, "answer", candidates[:6]
-    else:
-        msg = "I apologize, but I do not have sufficient information to answer this question accurately."
-        update_chat_history(user_message, msg, "no_context")
-        return msg, "no_context", None
+    return judge['df']
+    
 
 # -------------------- STREAMLIT UI (example) --------------------
 
@@ -541,15 +539,20 @@ init_session()
 if "debug" not in st.session_state:
     st.session_state.debug = []
 
-df= pd.read_excel("test_data.xlsx")
-questions= list(df['questions'])
-answerbot =[]
-for user_input in range(len(questions)):
-    if user_input%5==0:
-        print("user_input is ",user_input)
-    
-    reply, intent, candidates = medical_pipeline(questions[user_input])
-    answerbot.append(reply)
+question= ['when to bath baby ','cultural factors in bathing baby','nursing diagnosis of pre eclampsia','what is diagnosis of pre eclampsia','could you tell me about APH','Magnesium sulfate dose for neuroprotection','what are the intensives Care thermaly in stable babies','what is moral px','what is terminal protection','what is louber','what is freezer mesn','what is hypothermia','what does cynys and headache similarities and differences']
 
-df['answerbot']=answerbot
-df.to_excel("test_data2.xlsx",index=False,engine='openpyxl')
+topic_match=[]
+judge_response=[]
+reranker_scores=[]   # renamed to avoid clashing with CrossEncoder model
+
+for user_input in range(len(question)):
+    print(user_input)
+    
+    df = medical_pipeline(question[user_input])
+    topic_match.extend(df['topic_match'])
+    judge_response.extend(df['judge'])
+    reranker_scores.extend(df['score'])   # use the scores key from df
+
+df_out = {"topic_match":topic_match,"judge":judge_response,"reranker":reranker_scores}
+pd.DataFrame(df_out).to_csv(r"test2.csv", index=False)
+

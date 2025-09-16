@@ -131,8 +131,11 @@ Guidance + few examples:
 - FOLLOW_UP: short answers to a previous assistant suggestion, e.g. assistant asked "Would you like to know about malaria prevention?" and user replies "yes" or "prevention please" -> FOLLOW_UP.
 - CHITCHAT: greetings, thanks, smalltalk, profanity, or explicit "stop" requests, anything not medical_question or follow up -> CHITCHAT.
 - MEDICAL_QUESTION: any standalone question that asks for medical facts, diagnoses, treatments, or definitions.
+- MEDICAL_QUESTION : any medical word or phrase in the question, even if spellings is mis-spelled or mis-phrased to a medical content 
 
 Examples:
+
+
 chat_history: "Assistant: Would you like to know about jaundice?"
 question: "yes"
 -> {{"label":"FOLLOW_UP","reason":"affirmation to assistant suggestion"}}
@@ -340,7 +343,9 @@ def judge_sufficiency(query, candidates, judge_llm=llm, threshold_weak=0.25):
     """
     
     qualified = []
-    for c in candidates[:6]:  # inspect up to 12
+    followup_chunks=[]
+    print("len of candidates",len(candidates))
+    for c in candidates:  # inspect up to 12
         snippet = f"Source: {c['meta'].get('doc_name','unknown')}\nExcerpt: {c['text']}"
         prompt = judge_prompt.format(query=query, context_snippet=snippet)
 
@@ -352,16 +357,20 @@ def judge_sufficiency(query, candidates, judge_llm=llm, threshold_weak=0.25):
             print(obj)
             if obj.get("sufficient", False):
                 qualified.append(c)
+            else:
+                followup_chunks.append(c)
         except Exception:
             if c["scores"]["cross"] > threshold_weak:
                 qualified.append(c)
+            else:
+                followup_chunks.append(c)
 
-    # top 4 max for answering
-    answer_chunks = qualified[:min(4, len(qualified))]
-    # next 2 max for follow-up
-    followup_chunks = qualified[4:6] if len(qualified) > 4 else candidates[len(qualified):len(qualified)+2]
-
-    return {"answer_chunks": answer_chunks, "followup_chunks": followup_chunks}
+    print("BEFORE len of answer_chunks",len(qualified),"BEFORE len of followup_chunks",len(followup_chunks))
+    if len(followup_chunks)==0:
+        followup_chunks=qualified[-2:]
+        qualified=qualified[:-2]
+    print("AFTER len of answer_chunks",len(qualified),"AFTER len of followup_chunks",len(followup_chunks))
+    return {"answer_chunks": qualified[:4], "followup_chunks": followup_chunks[:2]}
 
 def synthesize_answer(query, top_candidates, context_followup, main_llm=llm):
     # Build context from top 3 candidates
@@ -373,6 +382,7 @@ def synthesize_answer(query, top_candidates, context_followup, main_llm=llm):
             sources.append(src)
         ctx_parts.append(f"From [{src}]:\n{c['text']}")
     context = "\n\n".join(ctx_parts)
+    context_followup = "\n\n".join(context_followup)
     sources_str = " and ".join([Path(s).stem for s in sources]) if sources else "unknown"
 
     prompt = answer_prompt.format(
