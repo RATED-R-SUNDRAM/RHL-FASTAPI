@@ -163,7 +163,7 @@ user_message:
 )
 
 reformulate_prompt = PromptTemplate(
-    input_variables=["chat_history", "last_suggested", "question",'classifier'],
+    input_variables=["chat_history", "last_suggested", "question"],
    template="""
 Return JSON only: with keys as "Rewritten" and "Correction" where correction being a dict of <original:corrected> pairs.
 
@@ -187,7 +187,7 @@ Few tricky examples:
 
 - chat_history: ""
   question: "denger sign for johndice"
-  -> Rewritten: "WHat are the danger signs for jaundice?", Correction: {"johndice":"jaundice"}
+  -> Rewritten: "WHat are the danger signs for jaundice?", Correction: {{"johndice":"jaundice"}}
 
 - chat_history: ""
   question: "depression"
@@ -343,37 +343,65 @@ def judge_sufficiency(query, candidates, judge_llm=llm, threshold_weak=0.25):
     Return the top 4 qualified chunks for answering,
     and next 2 for follow-up suggestion.
     """
-    
-    qualified = []
-    followup_chunks=[]
+
+    qualified_with_scores = [] # Store qualified chunks along with their cross-encoder scores and topic_match
+    followup_chunks_raw = [] # Store non-qualified chunks for potential follow-up
+    topic_match_order = {"strong": 3, "medium": 2, "absolutely_not_possible": 1}
+
     print("len of candidates",len(candidates))
-    for c in candidates:  # inspect up to 12
-        snippet = f"Source: {c['meta'].get('doc_name','unknown')}\nExcerpt: {c['text']}"
+    for c in candidates:  # inspect up to 12. Iterate through all candidates initially
+        snippet = f"Source: {c['meta'].get('doc_name','unknown')}\\nExcerpt: {c['text']}"
         prompt = judge_prompt.format(query=query, context_snippet=snippet)
 
         resp = judge_llm.invoke([HumanMessage(content=prompt)]).content
-        #print(candidates, resp)
 
         try:
             obj = json.loads(resp[resp.rfind("{"):resp.rfind("}")+1])
             print(obj)
+            topic_match_label = obj.get("topic_match", "absolutely_not_possible")
+            # Store topic_match_score in the chunk's meta for easier sorting
+            c['meta']['topic_match_score'] = topic_match_order.get(topic_match_label, 0) # Default to 0 for unknown/error
+
             if obj.get("sufficient", False):
-                qualified.append(c)
+                qualified_with_scores.append(c) # Add to qualified list
             else:
-                followup_chunks.append(c)
+                followup_chunks_raw.append(c)
         except Exception:
+            # Fallback based on cross-encoder score if LLM judge fails
+            # Assign a default topic_match_score (e.g., 'medium' equivalent if LLM fails to parse)
+            c['meta']['topic_match_score'] = topic_match_order.get("medium", 0)
             if c["scores"]["cross"] > threshold_weak:
-                qualified.append(c)
+                qualified_with_scores.append(c)
             else:
-                followup_chunks.append(c)
+                followup_chunks_raw.append(c)
 
-    print("BEFORE len of answer_chunks",len(qualified),"BEFORE len of followup_chunks",len(followup_chunks))
-    if len(followup_chunks)==0:
-        followup_chunks=qualified[-2:]
-        qualified=qualified[:-2]
-    print("AFTER len of answer_chunks",len(qualified),"AFTER len of followup_chunks",len(followup_chunks))
-    return {"answer_chunks": qualified[:4], "followup_chunks": followup_chunks[:2]}
+    # NEW: Sort qualified chunks first by topic_match_score (desc), then by cross score (desc)
+    qualified = sorted(qualified_with_scores,
+                       key=lambda x: (x['meta'].get('topic_match_score', 0), x["scores"]["cross"]),
+                       reverse=True)
 
+    print("BEFORE len of answer_chunks",len(qualified),"BEFORE len of followup_chunks",len(followup_chunks_raw))
+
+    answer_chunks = qualified[:4] # Take top 4 from the re-sorted qualified list
+
+    # Ensure all followup candidates also have a topic_match_score for consistent sorting
+    for c in followup_chunks_raw:
+        if 'topic_match_score' not in c['meta']:
+            c['meta']['topic_match_score'] = topic_match_order.get("absolutely_not_possible", 0) # Default for raw fallbacks
+
+    # Now, combine any remaining qualified chunks with the initially non-qualified ones for follow-up
+    # This ensures higher-scored but not-top-4 answer chunks can still be follow-ups
+    remaining_qualified_for_followup = qualified[4:]
+
+    # Sort these combined candidates using the same two-tier logic
+    combined_followup_candidates = sorted(followup_chunks_raw + remaining_qualified_for_followup,
+                                          key=lambda x: (x['meta'].get('topic_match_score', 0), x["scores"]["cross"]),
+                                          reverse=True)
+
+    followup_chunks = combined_followup_candidates[:2]
+
+    print("AFTER len of answer_chunks",len(answer_chunks),"AFTER len of followup_chunks",len(followup_chunks))
+    return {"answer_chunks": answer_chunks, "followup_chunks": followup_chunks}
 def synthesize_answer(query, top_candidates, context_followup, main_llm=llm):
     # Build context from top 3 candidates
     sources = []
@@ -398,6 +426,7 @@ def synthesize_answer(query, top_candidates, context_followup, main_llm=llm):
 
     return resp
 
+
 # -------------------- CLASSIFY / REFORMULATE / CHITCHAT --------------------
 def classify_message(chat_history, user_message):
     prompt = classifier_prompt.format(chat_history=chat_history, question=user_message)
@@ -418,19 +447,6 @@ def classify_message(chat_history, user_message):
         return "CHITCHAT", "greeting heuristic"
     return "MEDICAL_QUESTION", "fallback"
 
-# def reformulate_query(chat_history, user_message, last_suggested=""):
-#     print("here")
-#     prompt = reformulate_prompt.format(chat_history=chat_history, last_suggested=last_suggested, question=user_message)
-#     append_debug("[reformulate] sending reformulation prompt")
-#     try:
-#         resp = llm.invoke([HumanMessage(content=prompt)]).content
-#         print("resp is  ",resp)
-#         parsed = safe_json_parse(resp)
-#         if parsed:
-#             return parsed.get("Rewritten", user_message), parsed.get("Correction", "")
-#     except Exception as e:
-#         append_debug(f"[reformulate] LLM failed: {e}")
-#     return user_message, ""
 def reformulate_query(chat_history, user_message,classify, last_suggested=""):
     print("here")
     prompt = f"""
