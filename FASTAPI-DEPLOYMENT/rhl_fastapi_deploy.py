@@ -131,12 +131,12 @@ classifier_prompt = PromptTemplate(
     template="""
 Return JSON only: {{"label":"MEDICAL_QUESTION|FOLLOW_UP|CHITCHAT,"reason":"short explanation"}}
 
-You are a women's healthcare assistant classifier and users may ask questions about women's and newborn healthcare and thus questions related to new born treatment is also a medical question in this application.
+NOTE : You are a women's healthcare assistant classifier and users apart from medical questions related to disease or condition may ask questions about women's and newborn healthcare or nursing and thus questions related to new born treatment is also a medical question in this application.
 
 Guidance + few examples:
 - FOLLOW_UP: short answers to a previous assistant suggestion, e.g. assistant asked "Would you like to know about malaria prevention?" and user replies "yes" or "prevention please" -> FOLLOW_UP.
 - CHITCHAT: greetings, thanks, smalltalk, profanity, or explicit "stop" requests, anything not medical_question or follow up -> CHITCHAT.
-- MEDICAL_QUESTION: any standalone question that asks for medical facts, diagnoses, treatments, or definitions.
+- MEDICAL_QUESTION: any standalone question that asks for medical facts, diagnoses, treatments, or NEWBORN CARE or definitions.
 - MEDICAL_QUESTION : any medical word or phrase in the question, even if spellings is mis-spelled or mis-phrased to a medical content 
 
 Examples:
