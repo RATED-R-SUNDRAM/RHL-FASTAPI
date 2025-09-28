@@ -227,9 +227,9 @@ Rules: -
 )
 
 judge_prompt = PromptTemplate(
-    input_variables=["query","context_snippet"],
+    input_variables=["query","context_snippets"],
     template="""
-Return JSON only: {{"topic_match":"strong|medium|absolutely_not_possible","sufficient":true/false,"why":"short","alternative":"<anchored question or empty>"}}
+Return JSON only: {{"judgments":[{{"index": <index of snippet>, "topic_match":"strong|medium|absolutely_not_possible","sufficient":true/false,"why":"short","alternative":"<anchored question or empty>"}}]}}
 
 Guidance:
 - strong: Large facts about the query can be found and more supporting facts about the topic so A strong answer can be formed about the query from the context.
@@ -239,11 +239,13 @@ Guidance:
 sufficient is True when topic_match is strong or weak with some similarity to query or topic 
 Sufficient is False otherwise
 
+For each provided context snippet, make a judgment. The `index` in the output JSON should correspond to the order of the snippets in the input.
+
 Query:
 {query}
 
-Context (short excerpts):
-{context_snippet}
+Context Snippets:
+{context_snippets}
 """
 )
 
@@ -345,27 +347,53 @@ def judge_sufficiency(query: str, candidates: List[Dict[str, Any]], judge_llm: C
     topic_match_order = {"strong": 3, "medium": 2, "absolutely_not_possible": 1}
 
     logging.info(f"len of candidates {len(candidates)}")
-    for c in candidates:  # inspect up to 12. Iterate through all candidates initially
-        snippet = f"Source: {c['meta'].get('doc_name','unknown')}\\nExcerpt: {c['text']}"
-        prompt = judge_prompt.format(query=query, context_snippet=snippet)
 
+    # Prepare snippets for batch judging
+    snippets_for_llm = []
+    for idx, c in enumerate(candidates):
+        snippet_text = f"Source: {c['meta'].get('doc_name', 'unknown')}\nExcerpt: {c['text']}"
+        snippets_for_llm.append(f"Snippet {idx}:\n{snippet_text}")
+    
+    combined_snippets = "\n\n".join(snippets_for_llm)
+    
+    prompt = judge_prompt.format(query=query, context_snippets=combined_snippets)
+
+    try:
         resp = judge_llm.invoke([HumanMessage(content=prompt)]).content
-
-        try:
-            obj = json.loads(resp[resp.rfind("{"):resp.rfind("}")+1])
-            logging.info(obj)
-            topic_match_label = obj.get("topic_match", "absolutely_not_possible")
-            # Store topic_match_score in the chunk's meta for easier sorting
-            c['meta']['topic_match_score'] = topic_match_order.get(topic_match_label, 0) # Default to 0 for unknown/error
-            
-            if obj.get("sufficient", False):
-                qualified_with_scores.append(c) # Add to qualified list
-            else:
-                followup_chunks_raw.append(c)
-        except Exception:
-            # Fallback based on cross-encoder score if LLM judge fails
-            # Assign a default topic_match_score (e.g., 'medium' equivalent if LLM fails to parse)
-            c['meta']['topic_match_score'] = topic_match_order.get("medium", 0) 
+        parsed_judgments = safe_json_parse(resp)
+        if parsed_judgments and "judgments" in parsed_judgments:
+            for judgment in parsed_judgments["judgments"]:
+                idx = judgment.get("index")
+                if idx is not None and 0 <= idx < len(candidates):
+                    c = candidates[idx]
+                    topic_match_label = judgment.get("topic_match", "absolutely_not_possible")
+                    c['meta']['topic_match_score'] = topic_match_order.get(topic_match_label, 0)
+                    if judgment.get("sufficient", False):
+                        qualified_with_scores.append(c)
+                    else:
+                        followup_chunks_raw.append(c)
+                else:
+                    logging.warning(f"[judge_sufficiency] Invalid index in LLM judgment: {judgment}")
+                    # Fallback for invalid index
+                    if c["scores"]["cross"] > threshold_weak:
+                        qualified_with_scores.append(c)
+                    else:
+                        followup_chunks_raw.append(c)
+        else:
+            logging.warning("[judge_sufficiency] LLM did not return valid batched judgments. Falling back to cross-encoder scores.")
+            # Fallback based on cross-encoder score if LLM fails to parse or returns no judgments
+            for c in candidates:
+                c['meta']['topic_match_score'] = topic_match_order.get("medium", 0) # Assign a default topic_match_score
+                if c["scores"]["cross"] > threshold_weak:
+                    qualified_with_scores.append(c)
+                else:
+                    followup_chunks_raw.append(c)
+    except Exception as e:
+        logging.error(f"[judge_sufficiency] Error during batched LLM judging: {e}")
+        logging.exception("[judge_sufficiency] Full traceback for batched judging error:")
+        # Fallback based on cross-encoder score if LLM invocation fails
+        for c in candidates:
+            c['meta']['topic_match_score'] = topic_match_order.get("medium", 0) # Assign a default topic_match_score
             if c["scores"]["cross"] > threshold_weak:
                 qualified_with_scores.append(c)
             else:
