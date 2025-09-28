@@ -131,6 +131,8 @@ classifier_prompt = PromptTemplate(
     template="""
 Return JSON only: {{"label":"MEDICAL_QUESTION|FOLLOW_UP|CHITCHAT,"reason":"short explanation"}}
 
+You are a women's healthcare assistant classifier and users may ask questions about women's and newborn healthcare and thus questions related to new born treatment is also a medical question in this application.
+
 Guidance + few examples:
 - FOLLOW_UP: short answers to a previous assistant suggestion, e.g. assistant asked "Would you like to know about malaria prevention?" and user replies "yes" or "prevention please" -> FOLLOW_UP.
 - CHITCHAT: greetings, thanks, smalltalk, profanity, or explicit "stop" requests, anything not medical_question or follow up -> CHITCHAT.
@@ -140,17 +142,36 @@ Guidance + few examples:
 Examples:
 
 
+
+
 chat_history: "Assistant: Would you like to know about jaundice?"
 question: "yes"
 -> {{"label":"FOLLOW_UP","reason":"affirmation to assistant suggestion"}}
 
 chat_history: ""
+question: "how to feed a newborn?"
+-> {{"label":"MEDICAL_QUESTION","reason":"aksing about care and treatment of newborn"}}
+
+
+
+chat_history: ""
 question: "hi, how are you?"
 -> {{"label":"CHITCHAT","reason":"greeting"}}
+
+
+chat_history: ""
+question: "when to bath my new born?"
+-> {{"label":"MEDICAL_QUESTION","reason":"aksing about care and treatment of newborn"}}
 
 chat_history: ""
 question: "what causes jaundice?"
 -> {{"label":"MEDICAL_QUESTION","reason":"standalone medical question"}}
+
+chat_history: ""
+question: "baby is not sucking mother's milk"
+-> {{"label":"MEDICAL_QUESTION","reason":"aksing about care and treatment of newborn"}}
+
+
 
 chat_history: ""
 question: "show me bitcoin price"
@@ -173,6 +194,7 @@ Rules: -
   - Be humourous and chirpy unless the user has a distres in that case give very very genric politically correct advice and let them know only for any women's health related question you can help
   - Do not directly give out what you can and can not answer (for eg ?: dont directly msg I am not a doctor in general salutations.)
   - You have no technical expertise you can just reply to {conversation} in such a way that adresses customers requests in a friendly, chatty yet very professional tone respond with witty, empathetic tone.
+  - Refrain to answer any question prompted deflect the conversation to encourage to ask medical question.
   - Refraining in giving technical response reply in a formal conversation bot style and insist user to ask any medical questions
   - Refrain from answering any off-topic questions, delegate to ask users to asking about medical questions
         For eg : 
@@ -189,6 +211,15 @@ Rules: -
   Conversation: {conversation}
 
   Reply: 
+
+
+  Examples: 
+  USer : how are you doing ?
+  BOT : I am doing great, how about you? , I can really help you with any medical related query.
+  User : What is the temprature today in Pune?
+  BOT : I am sorry I can not help you with that, I am just a medical bot , i'll be useful if you ask me any medical questions. 
+  User : I want to Suicide
+  BOT : I'm sorry to hear that. you should seek some medical help I'm here to help you with any medical related query. Please let me know how I can assist you.
 """
 )
 
