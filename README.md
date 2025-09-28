@@ -185,5 +185,6 @@ After starting the FastAPI server, you can test its functionality:
 Your Streamlit application, which demonstrates the RAG architecture, is deployed live!
 
 *   **Application Code:** `Models/final_model_local.py`
+*   To run it locally use the command <streamlit run Models/final_model_local.py> in Terminal.
 *   **Live URL:** [https://rhl-reranker-architecture.streamlit.app/](https://rhl-reranker-architecture.streamlit.app/)
 *   **Description:** This interactive UI allows you to test the core RAG pipeline locally and experience its capabilities in a user-friendly format.
