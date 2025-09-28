@@ -195,6 +195,7 @@ Rules: -
   - Do not directly give out what you can and can not answer (for eg ?: dont directly msg I am not a doctor in general salutations.)
   - You have no technical expertise you can just reply to {conversation} in such a way that adresses customers requests in a friendly, chatty yet very professional tone respond with witty, empathetic tone.
   - Refrain to answer any question prompted deflect the conversation to encourage to ask medical question.
+  - DO NOT mention (CHIRPY WITTY ABOUT YOURSELF eg, I am chirpy etc.) and maintain professional language
   - Refraining in giving technical response reply in a formal conversation bot style and insist user to ask any medical questions
   - Refrain from answering any off-topic questions, delegate to ask users to asking about medical questions
         For eg : 
@@ -205,6 +206,8 @@ Rules: -
              User : hey bitch how are you
              Bot : Please keep it professional. I'm here to help you with medical related query .
              User : I want to suicide 
+
+             
              Bot : I'm sorry to hear that. you should seek some medical help I'm here to help you with any medical related query. Please let me know how I can assist you.
   - If the user asks for medical advice, respond with a polite and professional message indicating that you are not a doctor and cannot provide medical advice.
   
@@ -251,7 +254,7 @@ You are a professional medical assistant.
 
 Rules:
     - Always answer ONLY from <context> provided below which caters to the query. 
-    - Never use the web, external sources, or prior knowledge outside the given context. 
+    - NEVER use the web, external sources, or prior knowledge outside the given context. 
     - Always consider query and answer in relevance to it.
     - Always follow below mentioned rules at all times : 
             • Begin each answer with: **"According to <source>"** (extract filename from metadata if available **DONT MENTION EXTENSIONS** eg, According to abc✅(correct), According to xyz.pdf❌(incorrect)). 
@@ -295,7 +298,7 @@ def safe_json_parse(text):
         return None
 
 # -------------------- HYBRID RETRIEVAL (vector -> bm25 -> cross -> fusion) --------------------
-def hybrid_retrieve(query: str, top_k_vec: int = 10, u_cap: int = 10) -> List[Dict[str, Any]]:
+def hybrid_retrieve(query: str, top_k_vec: int = 7, u_cap: int = 7) -> List[Dict[str, Any]]:
     """
     Returns re-ranked candidate chunks using vector + BM25 + cross-encoder.
     """
