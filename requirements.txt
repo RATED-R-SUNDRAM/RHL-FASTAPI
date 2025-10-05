@@ -11,3 +11,4 @@ fitz
 frontend
 unstructured
 pdfminer
+aiosqlite

@@ -1,7 +1,6 @@
-import pandas as pd
+def func(a):
+    return 3
+    print(func(5))
 
-import numpy as np 
 
-import os
-
-print(os.getcwd())
+print(func(1))
