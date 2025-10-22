@@ -1,7 +1,6 @@
 import os
 import json
 import time
-import logging
 import asyncio
 import re
 from pathlib import Path
@@ -19,20 +18,23 @@ except Exception:
     RerankRequest = None
     FLASHRANK_AVAILABLE = False
 from pinecone import Pinecone, ServerlessSpec
-from langchain.prompts import PromptTemplate
-from langchain.schema import HumanMessage
+from langchain_core.prompts import PromptTemplate
+from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from typing import Optional
+
 
 # -------------------- CONFIG --------------------
 load_dotenv()
-# Default to WARNING to keep console quiet; timing/checkpoints use warnings so they remain visible
-logging.basicConfig(level=logging.WARNING, format="%(asctime)s • %(levelname)s • %(message)s")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_KEY = os.getenv("PINECONE_API_KEY_NEW")
 INDEX_NAME = os.getenv("PINECONE_INDEX", "medical-chatbot-index")
 CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+    raise RuntimeError("GOOGLE_API_KEY missing in environment")
 
 if not OPENAI_API_KEY or not PINECONE_KEY:
     raise RuntimeError("OPENAI_API_KEY or PINECONE_API_KEY_NEW missing in environment")
@@ -44,10 +46,11 @@ embedding_model: SentenceTransformer = None
 reranker: CrossEncoder = None
 pinecone_index: Pinecone.Index = None
 llm: ChatOpenAI = None
-chitchat_llm: ChatOpenAI = None
+# chitchat_llm removed - now using Gemini for chitchat
 summarizer_llm: ChatOpenAI = None
 reformulate_llm: ChatOpenAI = None
 classifier_llm: ChatOpenAI = None
+gemini_llm: ChatGoogleGenerativeAI = None  # Gemini for ALL LLM tasks
 EMBED_DIM: int = None
 
 # -------------------- Pydantic Model for Request Body --------------------
@@ -71,8 +74,8 @@ class CheckpointTimer:
     def mark(self, label: str) -> float:
         now = time.perf_counter()
         elapsed = now - self.last
-        # emit as WARNING so it's visible even when global level is WARNING
-        logging.warning(f"[{self.name}] {label} took {elapsed:.3f}s")
+        # print timing for this checkpoint
+        print(f"[{self.name}] {label} took {elapsed:.3f}s")
         self.last = now
         return elapsed
 
@@ -80,7 +83,7 @@ class CheckpointTimer:
         """Log total time since timer creation and return it."""
         now = time.perf_counter()
         total_elapsed = now - self.start
-        logging.warning(f"[{self.name}] TOTAL {label} took {total_elapsed:.3f}s")
+        print(f"[{self.name}] TOTAL {label} took {total_elapsed:.3f}s")
         self.last = now
         return total_elapsed
 
@@ -105,11 +108,11 @@ async def init_db():
         
         if 'intent' not in columns:
             await db.execute("ALTER TABLE chat_history ADD COLUMN intent TEXT")
-            logging.info("Added 'intent' column to chat_history table.")
+            print("[DB] Added 'intent' column to chat_history table.")
             
         if 'summary' not in columns:
             await db.execute("ALTER TABLE chat_history ADD COLUMN summary TEXT DEFAULT ''")
-            logging.info("Added 'summary' column to chat_history table.")
+            print("[DB] Added 'summary' column to chat_history table.")
             
         await db.commit()
 
@@ -173,9 +176,9 @@ async def _background_update_and_save(user_id: str, user_message: str, bot_reply
         )
         # persist the final record (async)
         await save_history(user_id, user_message, bot_reply, intent, updated_summary)
-        logging.info("[_background_update_and_save] saved history in background")
+        print("[_background_update_and_save] saved history in background")
     except Exception as e:
-        logging.exception(f"[_background_update_and_save] failed: {e}")
+        print(f"[_background_update_and_save] failed: {e}")
 
 # -------------------- PROMPTS (improved, few-shot + edge cases) --------------------
 classifier_prompt = PromptTemplate(
@@ -247,45 +250,193 @@ user_message:
 """
 )
 
+# Combined classification + reformulation prompt
+combined_classify_reformulate_prompt = PromptTemplate(
+    input_variables=["chat_history", "question"],
+    template="""
+Return JSON only: {{"classification":"MEDICAL_QUESTION|FOLLOW_UP|CHITCHAT","reason":"short explanation","rewritten_query":"optimized query","corrections":{{"misspelled":"corrected","abbrev":"expanded"}}}}
+
+You are a women's healthcare assistant that performs classification AND query reformulation in one step.
+
+CLASSIFICATION RULES:
+- MEDICAL_QUESTION: any standalone question about medical facts, diagnoses, treatments, NEWBORN CARE, or women's health
+- FOLLOW_UP: short responses to previous assistant suggestions (yes, sure, prevention please, etc.)
+- CHITCHAT: greetings, thanks, smalltalk, profanity, non-medical topics, or explicit "stop" requests OR ANYTHING WHICH IS NON-MEDICAL OR NON_FOLLOWUP
+
+REFORMULATION RULES:
+- If CHITCHAT: return original message unchanged (no reformulation needed)
+- If MEDICAL_QUESTION: rewrite as "Give information about [topic] and cure if available" format
+- If FOLLOW_UP: expand into full standalone question using chat history context
+- Correct spelling/abbreviations when meaning changes
+- Expand medical abbreviations (IUFD -> Intrauterine fetal death)
+- Keep rewritten_query concise and medically precise
+
+EXAMPLES:
+
+chat_history: Assistant: Would you like to know about jaundice?
+question: clarify its types
+-> {{"classification":"FOLLOW_UP","reason":"asking for clarification about previous answer","rewritten_query":"What are the different types of jaundice?","corrections":{{}}}}
+
+chat_history: Assistant: Would you like to know about jaundice?
+question: "clarify the dosoge and types of amilicin"
+-> {{"classification":"MEDICAL_QUESTION","reason":"new question not related to previous suggestion","rewritten_query":"Give information about amoxicillin dosage and types","corrections":{{"dosoge":"dosage","amilicin":"amoxicillin"}}}}
+
+chat_history: "Assistant: Would you like to know about jaundice?"
+question: "yes"
+-> {{"classification":"FOLLOW_UP","reason":"affirmation to assistant suggestion","rewritten_query":"Provide details on jaundice","corrections":{{}}}}
+
+chat_history: "Assistant: Would you like to know about jaundice?"
+question: "no"
+-> {{"classification":"CHITCHAT","reason":"user declining assistant suggestion","rewritten_query":"no","corrections":{{}}}}
+
+chat_history: ""
+question: "how to feed a newborn?"
+-> {{"classification":"MEDICAL_QUESTION","reason":"asking about newborn care","rewritten_query":"Give information about newborn feeding and care","corrections":{{}}}}
+
+chat_history: ""
+question: "hi, how are you?"
+-> {{"classification":"CHITCHAT","reason":"greeting","rewritten_query":"hi, how are you?","corrections":{{}}}}
+
+chat_history: ""
+question: "when to bath my new born?"
+-> {{"classification":"MEDICAL_QUESTION","reason":"asking about newborn care","rewritten_query":"Give information about newborn bathing and care","corrections":{{"bath":"bathe"}}}}
+
+chat_history: ""
+question: "what causes jaundice?"
+-> {{"classification":"MEDICAL_QUESTION","reason":"standalone medical question","rewritten_query":"Give information about jaundice causes and treatment","corrections":{{}}}}
+
+chat_history: ""
+question: "baby is not sucking mother's milk"
+-> {{"classification":"MEDICAL_QUESTION","reason":"asking about newborn feeding issues","rewritten_query":"Give information about newborn feeding problems and solutions","corrections":{{}}}}
+
+chat_history: ""
+question: "show me bitcoin price"
+-> {{"classification":"CHITCHAT","reason":"non-medical topic","rewritten_query":"show me bitcoin price","corrections":{{}}}}
+
+chat_history: ""
+question: "denger sign for johndice"
+-> {{"classification":"MEDICAL_QUESTION","reason":"medical question with misspellings","rewritten_query":"What are the danger signs for jaundice?","corrections":{{"denger":"danger","johndice":"jaundice"}}}}
+
+chat_history: ""
+question: "depression"
+-> {{"classification":"MEDICAL_QUESTION","reason":"single medical term","rewritten_query":"Give information about depression and cure if available","corrections":{{}}}}
+
+chat_history: "Assistant: Would you like to know about postpartum hemorrhage?"
+question: "any treatment?"
+-> {{"classification":"FOLLOW_UP","reason":"follow-up about previous topic","rewritten_query":"What are treatments for postpartum hemorrhage?","corrections":{{}}}}
+
+chat_history: "<answer> would you like to know about newborn jaundice?"
+question: "yes"
+-> {{"classification":"FOLLOW_UP","reason":"affirmation to suggestion","rewritten_query":"Provide details on newborn jaundice","corrections":{{}}}}
+
+chat_history: "<answer> would you like to know about newborn jaundice?"
+question: "sure but also provide cure"
+-> {{"classification":"FOLLOW_UP","reason":"affirmation with additional request","rewritten_query":"Provide details on newborn jaundice and its cure","corrections":{{}}}}
+
+Now analyze and respond:
+chat_history:
+{chat_history}
+user_message:
+{question}
+"""
+)
+
 # REMOVED reformulate_prompt PromptTemplate
 
 chitchat_prompt = PromptTemplate(
     input_variables=["conversation"],
     template="""
-Rules: - 
-  - Be humourous and chirpy unless the user has a distres in that case give very very genric politically correct advice and let them know only for any women's health related question you can help
-  - Do not directly give out what you can and can not answer (for eg ?: dont directly msg I am not a doctor in general salutations.)
-  - You have no technical expertise you can just reply to {conversation} in such a way that adresses customers requests in a friendly, chatty yet very professional tone respond with witty, empathetic tone.
-  - Refrain to answer any question prompted deflect the conversation to encourage to ask medical question.
-  - DO NOT mention (CHIRPY WITTY ABOUT YOURSELF eg, I am chirpy etc.) and maintain professional language
-  - Refraining in giving technical response reply in a formal conversation bot style and insist user to ask any medical questions
-  - Refrain from answering any off-topic questions, delegate to ask users to asking about medical questions
-        For eg : 
-             User : how are you doing ?
-             Bot : Answer
-             User : who is your favourite cricekter ?
-             Bot : I am just a medical bot , i'll be useful if you ask me any medical questions. 
-             User : hey bitch how are you
-             Bot : Please keep it professional. I'm here to help you with medical related query .
-             User : I want to suicide 
-
-             
-             Bot : I'm sorry to hear that. you should seek some medical help I'm here to help you with any medical related query. Please let me know how I can assist you.
-  - If the user asks for medical advice, respond with a polite and professional message indicating that you are not a doctor and cannot provide medical advice.
-  
-  Conversation: {conversation}
-
-  Reply: 
+Instructions:
 
 
-  Examples: 
-  USer : how are you doing ?
-  BOT : I am doing great, how about you? , I can really help you with any medical related query.
-  User : What is the temprature today in Pune?
-  BOT : I am sorry I can not help you with that, I am just a medical bot , i'll be useful if you ask me any medical questions. 
-  User : I want to Suicide
-  BOT : I'm sorry to hear that. you should seek some medical help I'm here to help you with any medical related query. Please let me know how I can assist you.
-"""
+
+
+
+Respond to the user’s input ({conversation}) with a friendly, professional, and empathetic tone, avoiding technical expertise.
+
+
+
+Maintain a conversational style, steering users toward women’s health-related medical questions without explicitly listing capabilities or limitations (e.g., avoid saying "I am not a doctor").
+
+
+
+Unless distress is detected (e.g., suicidal intent), use a light, engaging tone to encourage medical queries.
+
+
+
+For distress signals, provide generic, politically correct advice and gently redirect to medical questions.
+
+
+
+Avoid self-referential comments about tone (e.g., "I am chirpy") and focus on the user’s input.
+
+
+
+If medical advice is requested, politely decline and redirect to medical questions without technical input.
+
+Examples:
+
+
+
+
+
+User: "How are you doing?"
+Bot: "I’m doing wonderfully, thank you! How about you? I’d be delighted to assist with any women’s health questions you might have."
+
+
+
+User: "Who is your favorite cricketer?"
+Bot: "I appreciate the interest, but I’m here to support you with women’s health topics. Feel free to ask me anything related!"
+
+
+
+User: "Hey bitch, how are you?"
+Bot: "Please let’s keep this respectful. I’m here to help with women’s health-related queries—how can I assist you today?"
+
+
+
+User: "I want to suicide."
+Bot: "I’m truly sorry to hear you’re feeling this way. Please seek professional medical help. I’m available to support you with women’s health questions—let me know how I can assist."
+
+
+
+User: "What is the temperature today in Pune?"
+Bot: "I can’t help with that, but I’d love to assist with women’s health topics. Do you have any questions in that area?"
+
+
+
+User: "How do I treat a cold?"
+Bot: "I’m not able to provide medical advice, but I’d be happy to help with women’s health-related questions. What else can I assist you with?"
+
+
+
+User: "Tell me about pregnancy."
+Bot: "I can’t offer medical advice, but I’m here to guide you toward women’s health topics. Would you like information on related subjects?"
+
+Edge Cases:
+
+
+
+
+
+User: "Goodbye."
+Bot: "Take care! I’m here whenever you’d like to discuss women’s health—feel free to return!"
+
+
+
+User: "You’re useless!"
+Bot: "I’m sorry you feel that way. I’m designed to assist with women’s health questions—perhaps there’s something I can help with there?"
+
+
+
+User: "I feel so alone."
+Bot: "I’m sorry you’re feeling that way. Please consider reaching out for support. I can assist with women’s health topics—how else may I help?"
+
+Response Format:
+
+Provide a single, concise reply based on the above guidelines.
+
+Conversation: {conversation} Reply:"""
 )
 
 judge_prompt = PromptTemplate(
@@ -320,6 +471,7 @@ Rules:
     - Always answer ONLY from <context> provided below which caters to the query. 
     - NEVER use the web, external sources, or prior knowledge outside the given context. 
     - Always consider query and answer in relevance to it.
+    - ANSWER STRICTLY IN 150-200 WORDS (USING BULLET AND SUB-BULLET POINTS [MAX 5-6 POINTS]) which encapusaltes the key points and information from the context to answer the query in an APT FLOW
     - Always follow below mentioned rules at all times : 
             • Begin each answer with: **"According to <source>"** (extract filename from metadata if available **DONT MENTION EXTENSIONS** eg, According to abc✅(correct), According to xyz.pdf❌(incorrect)). 
             • Answer concisely in bullet and sub-bullet points. 
@@ -329,8 +481,10 @@ Rules:
     - Answer the best answer that can be framed from the context to the query and dont mentions referance to what's not-there in the context (for eg . the document doesn't have much info about <topic> ❌ [these kind of sentence refering about the doc other than the source is not needed])
     - Respect chat history for coherence. 
     - Always include a follow up question 
-         - if <context_followup> is non-empty in the format(without bullet points) "Would you like to know about <a follow up question from context_followup not overlapping with the answer generated>?"
-         - The genrated follow up should be about a medical topic and not any general topic(eg.Clinical Reference Manual for Advanced Neonatal Care in Ethiopia?" ❌) strictly from context_followup
+         - if <context_followup> is non-empty in the format(without bullet points) "Would you like to know about <a follow up question STRICTLY from context_followup not overlapping with the answer generated>?"
+         - The genrated follow up should be about a medical topic and not any general topic(eg.Clinical Reference Manual for Advanced Neonatal Care in Ethiopia?" ❌) STRICTLY from context_followup
+
+    - STRICTLY ADHERE TO THE WORD LIMIT AND BULLET POINT RULES and not fetching any information from the web or general knowledge or prior knowledge or any other sources.
 
 Example :  Query : what is cure for dispesion? 
 Correction: dispersion -> depression
@@ -368,10 +522,22 @@ def hybrid_retrieve(query: str, top_k_vec: int = 10, u_cap: int = 7) -> List[Dic
     """
     Returns re-ranked candidate chunks using vector + BM25 + cross-encoder.
     """
+    print("="*60)
+    print("HYBRID RETRIEVAL BLOCK BREAKDOWN")
+    print("="*60)
+    print(f"[HYBRID] Query: {query[:50]}...")
+    print(f"[HYBRID] top_k_vec={top_k_vec}, u_cap={u_cap}")
+    
     timer = CheckpointTimer("hybrid_retrieve")
-    # 1) Vector search
+    
+    # 1) Vector search - EMBEDDING ENCODING
+    print("[HYBRID] Step 1: Encoding query with embedding model...")
     q_emb = embedding_model.encode(query, convert_to_numpy=True).tolist()
     timer.mark("embedding.encode")
+    print(f"[HYBRID] embedding.encode took {timer.last - timer.start:.3f}s")
+    
+    # 2) PINECONE VECTOR SEARCH
+    print("[HYBRID] Step 2: Querying Pinecone vector database...")
     vec_resp = pinecone_index.query(
         vector=q_emb,
         top_k=top_k_vec,
@@ -379,17 +545,28 @@ def hybrid_retrieve(query: str, top_k_vec: int = 10, u_cap: int = 7) -> List[Dic
         include_values=False
     )
     timer.mark("pinecone.query")
+    print(f"[HYBRID] pinecone.query took {timer.last - timer.start:.3f}s")
+    print(f"[HYBRID] Retrieved {len(vec_resp.matches)} matches from Pinecone")
 
+    # 3) PROCESS MATCHES
+    print("[HYBRID] Step 3: Processing matches and deduplicating...")
     vec_matches = [{"id": m.id, "text": m.metadata.get("text_full", m.metadata.get("text_snippet", "")), "meta": m.metadata} for m in vec_resp.matches]
+    timer.mark("process_matches")
+    print(f"[HYBRID] process_matches took {timer.last - timer.start:.3f}s")
 
-    # 3) Combine & cap
+    # 4) COMBINE & CAP
     candidates = {m["id"]: m for m in (vec_matches)}  # deduplicate
     candidates = list(candidates.values())[:u_cap]
+    timer.mark("deduplicate_cap")
+    print(f"[HYBRID] deduplicate_cap took {timer.last - timer.start:.3f}s")
+    print(f"[HYBRID] Final candidates: {len(candidates)}")
 
-    # 4) Re-rank: prefer fast FlashRank reranker if available, otherwise fall back to CrossEncoder
+    # 5) RE-RANKING
+    print("[HYBRID] Step 4: Re-ranking candidates...")
     if candidates:
         # If FlashRank Ranker is available, it exposes a `rerank` method
         if hasattr(reranker, "rerank"):
+            print("[HYBRID] Using FlashRank reranker...")
             passages = [{"id": c["id"], "text": c["text"], "meta": c["meta"]} for c in candidates]
             request = RerankRequest(query=query, passages=passages)
             try:
@@ -403,30 +580,43 @@ def hybrid_retrieve(query: str, top_k_vec: int = 10, u_cap: int = 7) -> List[Dic
                     else:
                         c["scores"] = {"cross": 0.0}
             except Exception as e:
-                logging.error(f"[hybrid_retrieve] FlashRank rerank failed: {e}")
+                print(f"[hybrid_retrieve] FlashRank rerank failed: {e}")
                 # fallback: set neutral scores so later steps can handle
                 for c in candidates:
                     c["scores"] = {"cross": 0.0}
             timer.mark("flashrank.rerank")
+            print(f"[HYBRID] flashrank.rerank took {timer.last - timer.start:.3f}s")
         else:
             # Fallback: existing CrossEncoder.predict path
+            print("[HYBRID] Using CrossEncoder reranker...")
             pairs = [(query, c["text"]) for c in candidates]
             try:
                 scores = reranker.predict(pairs)
                 for i, c in enumerate(candidates):
                     c["scores"] = {"cross": float(scores[i])}
             except Exception as e:
-                logging.error(f"[hybrid_retrieve] CrossEncoder predict failed: {e}")
+                print(f"[hybrid_retrieve] CrossEncoder predict failed: {e}")
                 for c in candidates:
                     c["scores"] = {"cross": 0.0}
             timer.mark("cross-encoder.predict")
+            print(f"[HYBRID] cross-encoder.predict took {timer.last - timer.start:.3f}s")
     else:
         # no candidates
+        print("[HYBRID] No candidates found")
         timer.mark("no_candidates")
 
-    # Sort by reranker score (named 'cross' for compatibility)
+    # 6) SORT CANDIDATES
+    print("[HYBRID] Step 5: Sorting candidates by relevance score...")
     candidates = sorted(candidates, key=lambda x: x.get("scores", {}).get("cross", 0.0), reverse=True)
     timer.mark("sort_candidates")
+    print(f"[HYBRID] sort_candidates took {timer.last - timer.start:.3f}s")
+    
+    # FINAL SUMMARY
+    total_time = timer.total("hybrid_retrieve")
+    print(f"[HYBRID] TOTAL HYBRID RETRIEVAL TIME: {total_time:.3f}s")
+    print(f"[HYBRID] Returning {len(candidates)} ranked candidates")
+    print("="*60)
+    
     return candidates
 
 # -------------------- JUDGE + ANSWER --------------------
@@ -436,16 +626,17 @@ def judge_sufficiency(query: str, candidates: List[Dict[str, Any]], judge_llm: C
     Return the top 4 qualified chunks for answering,
     and next 2 for follow-up suggestion.
     """
-    global llm # Ensure llm is used for judging
+    global gemini_llm # Use Gemini for judging instead of OpenAI
 
-    if judge_llm is None: # Use global llm if not explicitly passed
-        judge_llm = llm
+    if judge_llm is None: # Use Gemini LLM for judging
+        judge_llm = gemini_llm
 
     qualified_with_scores = [] # Store qualified chunks along with their cross-encoder scores and topic_match
     followup_chunks_raw = [] # Store non-qualified chunks for potential follow-up
     topic_match_order = {"strong": 3, "medium": 2, "absolutely_not_possible": 1}
 
-    logging.info(f"len of candidates {len(candidates)}")
+    print(f"[judge_sufficiency] len of candidates {len(candidates)}")
+    print("[judge_sufficiency] Using GEMINI LLM for judging")
     timer = CheckpointTimer("judge_sufficiency")
 
     # Prepare snippets for batch judging
@@ -461,7 +652,7 @@ def judge_sufficiency(query: str, candidates: List[Dict[str, Any]], judge_llm: C
     try:
         resp = judge_llm.invoke([HumanMessage(content=prompt)]).content
         # PRINT: raw judge LLM response for demo/inspection
-        print("[JUDGE_RAW_RESP]:", resp)
+        #print("[JUDGE_RAW_RESP]:", resp)
         timer.mark("judge_llm.invoke")
         parsed_judgments = safe_json_parse(resp)
         # PRINT: parsed judgments (or None)
@@ -478,14 +669,14 @@ def judge_sufficiency(query: str, candidates: List[Dict[str, Any]], judge_llm: C
                     else:
                         followup_chunks_raw.append(c)
                 else:
-                    logging.warning(f"[judge_sufficiency] Invalid index in LLM judgment: {judgment}")
+                    print(f"[judge_sufficiency] Invalid index in LLM judgment: {judgment}")
                     # Fallback for invalid index
                     if c["scores"]["cross"] > threshold_weak:
                         qualified_with_scores.append(c)
                     else:
                         followup_chunks_raw.append(c)
         else:
-            logging.warning("[judge_sufficiency] LLM did not return valid batched judgments. Falling back to cross-encoder scores.")
+            print("[judge_sufficiency] LLM did not return valid batched judgments. Falling back to cross-encoder scores.")
             print("[JUDGE_PARSED]: None or invalid format; falling back to cross-encoder scores")
             # Fallback based on cross-encoder score if LLM fails to parse or returns no judgments
             for c in candidates:
@@ -495,8 +686,7 @@ def judge_sufficiency(query: str, candidates: List[Dict[str, Any]], judge_llm: C
                 else:
                     followup_chunks_raw.append(c)
     except Exception as e:
-        logging.error(f"[judge_sufficiency] Error during batched LLM judging: {e}")
-        logging.exception("[judge_sufficiency] Full traceback for batched judging error:")
+        print(f"[judge_sufficiency] Error during batched LLM judging: {e}")
         # Fallback based on cross-encoder score if LLM invocation fails
         print(f"[JUDGE_ERROR]: {e}")
         for c in candidates:
@@ -512,7 +702,7 @@ def judge_sufficiency(query: str, candidates: List[Dict[str, Any]], judge_llm: C
                        reverse=True)
     timer.mark("sort_qualified")
     
-    logging.info(f"BEFORE len of answer_chunks {len(qualified)} BEFORE len of followup_chunks {len(followup_chunks_raw)}")
+    print(f"[judge_sufficiency] BEFORE answer_chunks={len(qualified)} BEFORE followup_chunks={len(followup_chunks_raw)}")
     
     answer_chunks = qualified[:4] # Take top 4 from the re-sorted qualified list
     
@@ -539,15 +729,15 @@ def judge_sufficiency(query: str, candidates: List[Dict[str, Any]], judge_llm: C
     if followup_chunks:
         print("[JUDGE_FOLLOWUP_IDS]", [c.get('id') for c in followup_chunks])
 
-    logging.info(f"AFTER len of answer_chunks {len(answer_chunks)} AFTER len of followup_chunks {len(followup_chunks)}")
+    print(f"[judge_sufficiency] AFTER answer_chunks={len(answer_chunks)} AFTER followup_chunks={len(followup_chunks)}")
     timer.mark("done")
     return {"answer_chunks": answer_chunks, "followup_chunks": followup_chunks}
 
 def synthesize_answer(query: str, top_candidates: List[Dict[str, Any]], context_followup: str, main_llm: ChatOpenAI | None = None) -> str:
-    global llm # Ensure llm is used for synthesis
+    global gemini_llm # Use Gemini for synthesis instead of OpenAI
 
-    if main_llm is None: # Use global llm if not explicitly passed
-        main_llm = llm
+    if main_llm is None: # Use Gemini LLM for synthesis
+        main_llm = gemini_llm
 
     # Build context from top 3 candidates
     sources = []
@@ -567,7 +757,7 @@ def synthesize_answer(query: str, top_candidates: List[Dict[str, Any]], context_
         context_followup=context_followup_str or "",
         query=query
     )
-    logging.info("[answer] sending synthesis prompt to LLM")
+    print("[answer] sending synthesis prompt to GEMINI LLM")
     timer = CheckpointTimer("synthesize_answer")
     resp = main_llm.invoke([HumanMessage(content=prompt)]).content
     timer.mark("synthesize_llm.invoke")
@@ -577,7 +767,7 @@ def synthesize_answer(query: str, top_candidates: List[Dict[str, Any]], context_
 # -------------------- CLASSIFY / REFORMULATE / CHITCHAT --------------------
 def classify_message(chat_history: str, user_message: str) -> Tuple[str, str]:
     prompt = classifier_prompt.format(chat_history=chat_history, question=user_message)
-    logging.info("[classify] sending classification prompt")
+    print("[classify] sending classification prompt")
     try:
         # Prefer the dedicated classifier LLM for speed/consistency
         use_llm = classifier_llm if classifier_llm is not None else llm
@@ -590,7 +780,7 @@ def classify_message(chat_history: str, user_message: str) -> Tuple[str, str]:
         if parsed:
             return parsed.get("label", "MEDICAL_QUESTION"), parsed.get("reason", "")
     except Exception as e:
-        logging.error(f"[classify] LLM classify failed: {e}")
+        print(f"[classify] LLM classify failed: {e}")
 
     # # fallback heuristics
     # low = user_message.lower().strip()
@@ -601,7 +791,7 @@ def classify_message(chat_history: str, user_message: str) -> Tuple[str, str]:
 
 def reformulate_query(chat_history: str, user_message: str, classify_label: str) -> Tuple[str, Dict[str, str]]:
     global llm # Access global llm
-    logging.info("here (reformulate_query start)")
+    print("[reformulate] start")
     print("claasification label:", classify_label)
     timer = CheckpointTimer("reformulate_query")
     prompt = f"""
@@ -667,7 +857,7 @@ user_message:
 
 NOW REWRITE or return as it is in case of chitchat :
 """
-    logging.info("[reformulate] sending reformulation prompt")
+    print("[reformulate] sending reformulation prompt")
     try:
         # Attempt LLM invocation
         try:
@@ -675,17 +865,16 @@ NOW REWRITE or return as it is in case of chitchat :
             # PRINT: raw reformulation response
             print("[REFORM_RAW]:", resp)
             timer.mark("llm.invoke")
-            logging.info(f"[reformulate] Raw LLM response: {resp}")
+            print(f"[reformulate] Raw LLM response: {resp}")
         except Exception as llm_e:
-            logging.error(f"[reformulate] Error during LLM invoke in reformulate_query: {llm_e}")
-            logging.exception("[reformulate] Full traceback for LLM invoke error:")
+            print(f"[reformulate] Error during LLM invoke in reformulate_query: {llm_e}")
             # If LLM invocation fails, return user_message and empty dict as a fallback
             return user_message, {}
 
         parsed = safe_json_parse(resp)
         # PRINT: parsed reformulation output
         print("[REFORM_PARSED]:", parsed)
-        logging.info(f"[reformulate] Parsed LLM response: {parsed}")
+        print(f"[reformulate] Parsed LLM response: {parsed}")
         if parsed:
             # Ensure Correction is always a dictionary
             correction_output = parsed.get("Correction", {})
@@ -697,77 +886,171 @@ NOW REWRITE or return as it is in case of chitchat :
            
             return rewritten, correction_output
     except Exception as e:
-        logging.error(f"[reformulate] General error in reformulate_query: {e}")
-        logging.exception("[reformulate] Full traceback for general error:")
+        print(f"[reformulate] General error in reformulate_query: {e}")
     return user_message, {} # Default to empty dict for correction in all failure cases
 
-def handle_chitchat(user_message: str, chat_history: str) -> str:
-    prompt = chitchat_prompt.format(conversation=user_message, chat_history=chat_history)
-    logging.info("[chitchat] sending to chitchat model")
+def classify_and_reformulate(chat_history: str, user_message: str) -> Tuple[str, str, str, Dict[str, str]]:
+    """
+    Combined classification and reformulation using Gemini in a single LLM call.
+    Returns: (classification, reason, rewritten_query, corrections)
+    """
+    global gemini_llm
+    
+    print("="*60)
+    print("CLASSIFICATION + REFORMULATION BLOCK")
+    print("="*60)
+    
+    # Start timing for this block
+    block_start = time.perf_counter()
+    
+    prompt = combined_classify_reformulate_prompt.format(chat_history=chat_history, question=user_message)
+    print(f"[CLASSIFY_REFORM] Input: {user_message[:100]}...")
+    print(f"[CLASSIFY_REFORM] Chat history length: {len(chat_history)}")
+    print("[CLASSIFY_REFORM] Sending prompt to Gemini...")
+    
     try:
-        return chitchat_llm.invoke([HumanMessage(content=prompt)]).content
+        # Time the LLM call specifically
+        llm_start = time.perf_counter()
+        resp = gemini_llm.invoke([HumanMessage(content=prompt)]).content
+        llm_end = time.perf_counter()
+        
+        print(f"[CLASSIFY_REFORM] Gemini LLM call took {llm_end - llm_start:.3f} seconds")
+        
+        # Print raw response for debugging
+        print("[CLASSIFY_REFORM] Raw Gemini response:")
+        print("-" * 40)
+        print(resp)
+        print("-" * 40)
+        
+        # Parse JSON response
+        parse_start = time.perf_counter()
+        parsed = safe_json_parse(resp)
+        parse_end = time.perf_counter()
+        
+        print(f"[CLASSIFY_REFORM] JSON parsing took {parse_end - parse_start:.3f} seconds")
+        print("[CLASSIFY_REFORM] Parsed JSON:")
+        print("-" * 40)
+        print(parsed)
+        print("-" * 40)
+        
+        if parsed:
+            classification = parsed.get("classification", "MEDICAL_QUESTION")
+            reason = parsed.get("reason", "")
+            rewritten_query = parsed.get("rewritten_query", user_message)
+            corrections = parsed.get("corrections", {})
+            
+            # Ensure corrections is always a dict
+            if not isinstance(corrections, dict):
+                corrections = {}
+            
+            # For CHITCHAT, use original message unchanged
+            if classification.upper() == "CHITCHAT":
+                print("[CLASSIFY_REFORM] CHITCHAT detected - using original message unchanged")
+                rewritten_query = user_message
+                corrections = {}
+            
+            # Print detailed outputs
+            print("[CLASSIFY_REFORM] EXTRACTED RESULTS:")
+            print(f"  Classification: {classification}")
+            print(f"  Reason: {reason}")
+            print(f"  Rewritten Query: {rewritten_query}")
+            print(f"  Corrections: {corrections}")
+            
+            block_end = time.perf_counter()
+            print(f"[CLASSIFY_REFORM] TOTAL BLOCK TIME: {block_end - block_start:.3f} seconds")
+            print("="*60)
+            
+            return classification, reason, rewritten_query, corrections
+        else:
+            print("[CLASSIFY_REFORM] Failed to parse JSON response")
+            
     except Exception as e:
-        logging.error(f"[chitchat] LLM failed: {e}")
-        return "Whoa, let’s keep it polite, please! 😊"
+        print(f"[CLASSIFY_REFORM] Gemini LLM call failed: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # Fallback: return original message with default classification
+    block_end = time.perf_counter()
+    print(f"[CLASSIFY_REFORM] FALLBACK - TOTAL BLOCK TIME: {block_end - block_start:.3f} seconds")
+    print("="*60)
+    return "MEDICAL_QUESTION", "fallback", user_message, {}
+
+def handle_chitchat(user_message: str, chat_history: str) -> str:
+    global gemini_llm
+    prompt = chitchat_prompt.format(conversation=user_message, chat_history=chat_history)
+    print("[chitchat] sending to GEMINI chitchat model")
+    try:
+        return gemini_llm.invoke([HumanMessage(content=prompt)]).content
+    except Exception as e:
+        print(f"[chitchat] Gemini LLM failed: {e}")
+        return "Whoa, let's keep it polite, please! 😊"
 
 # -------------------- MAIN PIPELINE (called by API) --------------------
 async def medical_pipeline_api(user_id: str, user_message: str, background_tasks: BackgroundTasks) -> Dict[str, Any]:
-    logging.info(f"[pipeline] Starting medical_pipeline_api for user_id: {user_id}, message: {user_message[:50]}")
+    print(f"[pipeline] Start user_id={user_id}, message={user_message[:50]}")
     timer = CheckpointTimer("medical_pipeline_api")
+    start_time = time.perf_counter()
+
     history_pairs, current_summary = await get_history(user_id)
+    t1 = time.perf_counter()
     timer.mark("get_history")
-    logging.info(f"[pipeline] Fetched history. Pairs: {len(history_pairs)}, Summary length: {len(current_summary)}")
+    print(f"history fetch took {t1 - start_time:.2f} secs")
+    print(f"[pipeline] History pairs={len(history_pairs)} summary_len={len(current_summary)}")
     
     # We need to reconstruct the chat_history for the LLM prompts
     chat_history_context_for_llm = get_chat_context(history_pairs, current_summary)
+    t2 = time.perf_counter()
     timer.mark("get_chat_context")
-    logging.info(f"[pipeline] chat_history (summary+last3) context length: {len(chat_history_context_for_llm)}")
+    print(f"chat context build took {t2 - t1:.2f} secs")
+    print(f"[pipeline] chat_context_len={len(chat_history_context_for_llm)}")
 
-    # 1) classify
-    logging.info("[pipeline] Step 1: Classifying message...")
-    label, reason = classify_message(chat_history_context_for_llm, user_message)
-    logging.info(f"[pipeline] classifier -> {label} ({reason})")
+    # Combined classification + reformulation using Gemini (OPTIMIZED: Single LLM call instead of two)
+    print("\n" + "="*80)
+    print("STEP 1+2: CLASSIFICATION + REFORMULATION (GEMINI OPTIMIZED)")
+    print("="*80)
+    print(f"[PIPELINE] Starting classify_and_reformulate for: {user_message[:50]}...")
+    
+    label, reason, rewritten, correction = classify_and_reformulate(chat_history_context_for_llm, user_message)
+    t3 = time.perf_counter()
+    
+    print(f"[PIPELINE] classify_and_reformulate took {t3 - t2:.2f} secs")
+    print(f"[PIPELINE] FINAL RESULTS:")
+    print(f"  Classification: {label}")
+    print(f"  Reason: {reason}")
+    print(f"  Rewritten Query: {rewritten}")
+    print(f"  Corrections: {correction}")
+    print("="*80)
 
     # If classifier says CHITCHAT, short-circuit: call chitchat LLM and return immediately
-    try:
-        if isinstance(label, str) and label.strip().upper() == "CHITCHAT":
-            logging.info("[pipeline] Classifier detected CHITCHAT — short-circuiting to chitchat LLM.")
-            reply = handle_chitchat(user_message, chat_history_context_for_llm)
-            # Do not update or save chitchat history per request
-            timer.total("request")
-            return {"answer": reply, "intent": "chitchat", "follow_up": None}
-    except Exception:
-        # If something unexpected happens, continue the normal flow
-        logging.exception("[pipeline] Error during chitchat short-circuit check; continuing pipeline")
+    # Use ORIGINAL user_message, NOT the rewritten version
+    if isinstance(label, str) and label.strip().upper() == "CHITCHAT":
+        print("[pipeline] CHITCHAT detected -> chitchat handler")
+        print(f"[pipeline] Using ORIGINAL message for chitchat: {user_message}")
+        reply = handle_chitchat(user_message, chat_history_context_for_llm)
+        # Do not update or save chitchat history per request
+        t_end = time.perf_counter()
+        timer.total("request")
+        print(f"total took {t_end - start_time:.2f} secs")
+        return {"answer": reply, "intent": "chitchat", "follow_up": None}
 
-    # 2) reformulate (handles follow-ups, abbrs, corrections)
-    logging.info("[pipeline] Step 2: Reformulating query...")
-    reformulate_result = reformulate_query(
-        chat_history_context_for_llm,
-        user_message,
-        label # Pass the classified label to reformulation
-    )
-    timer.mark("reformulate_query")
-    logging.info(f"[pipeline] Raw result from reformulate_query: {reformulate_result} (type: {type(reformulate_result)})")
-    rewritten, correction = reformulate_result # Unpack here
-    logging.info(f"[pipeline] Unpacked rewritten: {rewritten}, correction: {correction}")
-    logging.info(f"[pipeline] reformulated: {rewritten}  | correction: {correction}")
+    # Skip the old reformulation step since it's now combined above
 
 
 
     # ---- HYBRID RETRIEVAL ----
-    logging.info("[pipeline] Step 3 (Medical): Performing hybrid retrieval...")
+    print("[pipeline] Step 3: hybrid_retrieve")
     candidates = hybrid_retrieve(rewritten)   # vector + bm25 + rerank
+    t4 = time.perf_counter()
     timer.mark("hybrid_retrieve")
-    logging.info(f"[pipeline] retrieved {len(candidates)} re-ranked candidates")
+    print(f"retrieval took {t4 - t3:.2f} secs")
+    print(f"[pipeline] retrieved {len(candidates)} candidates")
 
-    logging.info("[pipeline] Step 4: Judging sufficiency...")
+    print("[pipeline] Step 4: judge_sufficiency")
     judge = judge_sufficiency(rewritten, candidates)
+    t5 = time.perf_counter()
     timer.mark("judge_sufficiency")
-    logging.info(
-        f"[pipeline] judge selected {len(judge['answer_chunks'])} answer chunks, "
-        f"{len(judge['followup_chunks'])} follow-up chunks"
-    )
+    print(f"judging took {t5 - t4:.2f} secs")
+    print(f"[pipeline] judge -> answers={len(judge['answer_chunks'])} followups={len(judge['followup_chunks'])}")
 
     # ---- JUDGE → SYNTHESIZE ----
     if judge["answer_chunks"]:
@@ -780,19 +1063,23 @@ async def medical_pipeline_api(user_id: str, user_message: str, background_tasks
             sec = fc["meta"].get("section") if fc.get("meta") else None
             followup_q = sec or (fc["text"])
 
-        logging.info("[pipeline] Step 5: Synthesizing answer...")
-        answer = synthesize_answer(rewritten, top4, followup_q,llm)
+        print("[pipeline] Step 5: synthesize_answer")
+        answer = synthesize_answer(rewritten, top4, followup_q, gemini_llm)
+        t6 = time.perf_counter()
         timer.mark("synthesize_answer")
+        print(f"synthesis took {t6 - t5:.2f} secs")
 
         # Apply correction prefix if needed
         if label != "FOLLOW_UP" and correction:
             correction_msg = "I guess you meant " + " and ".join(correction.values())
             answer = correction_msg + "\n" + answer
         # Schedule full update+save in background (do not run update_chat_history in request path)
-        logging.info("[pipeline] Scheduling background update+save for answer...")
+        print("[pipeline] schedule background save: answer")
         background_tasks.add_task(_background_update_and_save, user_id, user_message, answer, "answer", history_pairs, current_summary)
-        logging.info("[pipeline] Medical pipeline complete with answer; scheduled background update+save.")
+        print("[pipeline] done with answer")
+        t_end = time.perf_counter()
         timer.total("request")
+        print(f"total took {t_end - start_time:.2f} secs")
         return {"answer": answer, "intent": "answer", "follow_up": followup_q if followup_q else None}
 
     else:
@@ -801,18 +1088,20 @@ async def medical_pipeline_api(user_id: str, user_message: str, background_tasks
             "in my documents to answer this question accurately."
         )
         # Schedule full update+save in background for no_context
-        logging.info("[pipeline] Scheduling background update+save for no_context.")
+        print("[pipeline] schedule background save: no_context")
         background_tasks.add_task(_background_update_and_save, user_id, user_message, msg, "no_context", history_pairs, current_summary)
-        logging.info("[pipeline] Medical pipeline complete with no_context; scheduled background update+save.")
+        print("[pipeline] done with no_context")
+        t_end = time.perf_counter()
         timer.total("request")
+        print(f"total took {t_end - start_time:.2f} secs")
         return {"answer": msg, "intent": "no_context", "follow_up": None}
 
 
 # -------------------- API ENDPOINTS --------------------
 @app.on_event("startup")
 async def startup_event():
-    global embedding_model, reranker, pinecone_index, llm, chitchat_llm, summarizer_llm, reformulate_llm, classifier_llm, EMBED_DIM
-    logging.info("Initializing models and Pinecone client...")
+    global embedding_model, reranker, pinecone_index, llm, summarizer_llm, reformulate_llm, classifier_llm, gemini_llm, EMBED_DIM
+    print("[startup] Initializing models and Pinecone client...")
     t = CheckpointTimer("startup")
     embedding_model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
     t.mark("load_embedding_model")
@@ -829,24 +1118,35 @@ async def startup_event():
     pc = Pinecone(api_key=PINECONE_KEY)
     t.mark("init_pinecone_client")
     if INDEX_NAME not in pc.list_indexes().names():
-        logging.info("Creating Pinecone index (if needed)...")
+        print("[startup] Creating Pinecone index (if needed)...")
         pc.create_index(name=INDEX_NAME, dimension=EMBED_DIM, metric="cosine",
                         spec=ServerlessSpec(cloud="aws", region="us-east-1"))
         t.mark("create_pinecone_index")
     pinecone_index = pc.Index(INDEX_NAME)
     t.mark("pinecone_index_ready")
 
+    # Initialize OpenAI models
     llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0.0, api_key=OPENAI_API_KEY)
-    chitchat_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7, api_key=OPENAI_API_KEY)
+    # chitchat_llm removed - now using Gemini for chitchat
     summarizer_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0, api_key=OPENAI_API_KEY)
     reformulate_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0, api_key=OPENAI_API_KEY)
-    # Classifier uses a dedicated lightweight model for fast classification
     classifier_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0, api_key=OPENAI_API_KEY)
+    
+    # Initialize Gemini for ALL LLM tasks (classification, reformulation, judging, synthesis, chitchat)
+    gemini_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", api_key=GOOGLE_API_KEY)
     t.mark("init_llms")
 
     await init_db()
     t.mark("init_db")
-    logging.info("FastAPI application startup complete.")
+    print("[startup] FastAPI application startup complete.")
+
+@app.get("/test-debug")
+async def test_debug_endpoint():
+    """Test endpoint to verify debug statements are working"""
+    print("="*60)
+    print("TEST DEBUG ENDPOINT CALLED")
+    print("="*60)
+    return {"status": "debug_test_working", "message": "Check server console for debug output"}
 
 @app.get("/chat")
 async def chat_endpoint(
@@ -858,10 +1158,9 @@ async def chat_endpoint(
         response = await medical_pipeline_api(user_id, message, background_tasks)
         return response
     except Exception as e:
-        logging.error(f"Error in chat endpoint for user {user_id}: {e}")
+        print(f"[chat_endpoint] Error for user {user_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-

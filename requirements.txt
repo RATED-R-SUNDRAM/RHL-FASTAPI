@@ -1,6 +1,7 @@
 fastapi
 uvicorn[standard]
 langchain
+langchain-core
 langchain-openai
 langchain-pinecone
 langchain-huggingface
@@ -12,3 +13,4 @@ frontend
 unstructured
 pdfminer
 aiosqlite
+langchain-google-genai
