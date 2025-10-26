@@ -377,7 +377,7 @@ Avoid self-referential comments about tone (e.g., "I am chirpy") and focus on th
 
 If medical advice is requested, politely decline and redirect to medical questions without technical input.
 
-Examples:
+  Examples: 
 
 
 
@@ -1109,8 +1109,161 @@ Response (YES/NO only):"""
             print(f"[VIDEO_SYSTEM] LLM verification failed: {e}")
             return False
 
-# Global video matching system
-video_system: VideoMatchingSystem = None
+# -------------------- CACHE SYSTEM (BERT + LLM APPROACH) --------------------
+class CacheSystem:
+    def __init__(self, cache_file_path: str = "D:\\RHL-WH\\RHL-FASTAPI\\FILES\\cache_questions.xlsx"):
+        """Initialize the cache system using BERT similarity + LLM verification"""
+        self.cache_file_path = cache_file_path
+        self.question_list = []  # List of cached questions
+        self.answer_list = []    # List of corresponding answers
+        
+        # Load cache data
+        self._load_cache_data()
+        
+        # Initialize BERT model for similarity (reuse video system's model)
+        if self.question_list:
+            print("[CACHE_SYSTEM] Loading BERT model for cache similarity...")
+            self.similarity_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+            print("[CACHE_SYSTEM] BERT model loaded successfully")
+        else:
+            self.similarity_model = None
+    
+    def _load_cache_data(self):
+        """Load cache data from Excel file"""
+        try:
+            df = pd.read_excel(self.cache_file_path)
+            print(f"[CACHE_SYSTEM] Loaded {len(df)} cached Q&A pairs from {self.cache_file_path}")
+            
+            # Create simple lists
+            for idx, row in df.iterrows():
+                question = row['question'].strip()
+                answer = row['answer'].strip()
+                
+                if question and answer:
+                    self.question_list.append(question)
+                    self.answer_list.append(answer)
+            
+            print(f"[CACHE_SYSTEM] Created cache with {len(self.question_list)} questions")
+            print(f"[CACHE_SYSTEM] Sample cached questions:")
+            for i, q in enumerate(self.question_list[:3]):
+                print(f"  {i}: {q[:80]}...")
+            
+        except Exception as e:
+            print(f"[CACHE_SYSTEM] Error loading cache data: {e}")
+            self.question_list = []
+            self.answer_list = []
+    
+    def check_cache(self, reformulated_query: str) -> Optional[str]:
+        """Check if reformulated query matches any cached question using BERT + LLM verification"""
+        if not self.question_list or not self.similarity_model:
+            print("[CACHE_SYSTEM] No cache data or model available")
+            return None
+        
+        print("="*60)
+        print("CACHE SYSTEM BLOCK")
+        print("="*60)
+        print(f"[CACHE_SYSTEM] Checking cache for: {reformulated_query[:100]}...")
+        
+        # Step 1: BERT Semantic Similarity
+        print("[CACHE_SYSTEM] Step 1: Computing BERT semantic similarities...")
+        cache_start = time.perf_counter()
+        
+        # Encode reformulated query and all cached questions
+        query_embedding = self.similarity_model.encode([reformulated_query])
+        question_embeddings = self.similarity_model.encode(self.question_list)
+        
+        # Compute cosine similarities
+        similarities = cosine_similarity(query_embedding, question_embeddings)[0]
+        
+        # Find best match
+        best_idx = np.argmax(similarities)
+        best_similarity = similarities[best_idx]
+        
+        cache_end = time.perf_counter()
+        print(f"[CACHE_SYSTEM] BERT similarity computation took {cache_end - cache_start:.3f} seconds")
+        print(f"[CACHE_SYSTEM] Best similarity score: {best_similarity:.3f}")
+        print(f"[CACHE_SYSTEM] Best cached question: {self.question_list[best_idx][:100]}...")
+        
+        # Step 2: Combined LLM Verification + Reframing (only for top match)
+        if best_similarity >= 0.4:  # Higher threshold for cache (more strict)
+            print("[CACHE_SYSTEM] Step 2: Combined LLM verification and reframing...")
+            llm_start = time.perf_counter()
+            
+            result = self._verify_and_reframe_cache(reformulated_query, self.question_list[best_idx], self.answer_list[best_idx])
+            
+            llm_end = time.perf_counter()
+            print(f"[CACHE_SYSTEM] Combined LLM verification and reframing took {llm_end - llm_start:.3f} seconds")
+            
+            if result:
+                print(f"[CACHE_SYSTEM] Cache HIT! Returning reframed answer")
+                print("="*60)
+                return result
+            else:
+                print("[CACHE_SYSTEM] LLM verification failed - cache miss")
+                print("="*60)
+                return None
+        else:
+            print(f"[CACHE_SYSTEM] Similarity score {best_similarity:.3f} below threshold 0.4 - cache miss")
+            print("="*60)
+            return None
+    
+    def _verify_and_reframe_cache(self, reformulated_query: str, cached_question: str, cached_answer: str) -> Optional[str]:
+        """Combined verification and reframing: Check if cached answer can answer the query, and reframe if yes"""
+        prompt = f"""Analyze if the cached answer can be used to answer the reformulated query, and if yes, reframe it appropriately.
+
+Reformulated Query: {reformulated_query}
+
+Original Cached Question: {cached_question}
+
+Cached Answer: {cached_answer}
+
+Instructions:
+1. FIRST: Determine if the cached answer contains information that can answer the reformulated query
+2. If YES: Reframe the cached answer to directly address the reformulated query
+3. If NO: Return "NULL"
+
+Rules for Verification:
+- Return reframed answer ONLY if the cached answer contains relevant information for the query
+- Return "NULL" if the cached answer is about a different medical topic entirely
+- Return "NULL" if the cached answer lacks the specific information asked for
+
+Rules for Reframing (if applicable):
+- Use ONLY information from the cached answer - NO external knowledge
+- Maintain ALL medical facts from the cached answer
+- Adjust tense, flow, and structure to match the question asked
+- Do NOT add any external information not present in the cached answer
+- Do NOT remove any medical information from the cached answer
+- Keep the answer concise and directly relevant
+
+Examples:
+- Query: "What causes fever?" + Cached Answer: "Fever symptoms include..." → NULL (no cause info)
+- Query: "What causes fever?" + Cached Answer: "Fever is caused by infections..." → Reframe to focus on causes
+- Query: "How to treat jaundice?" + Cached Answer: "Jaundice symptoms are..." → NULL (no treatment info)
+- Query: "What are signs of dehydration?" + Cached Answer: "Dehydration signs include..." → Reframe to focus on signs
+
+Response: Return the reframed answer if applicable, or "NULL" if not applicable."""
+
+        try:
+            response = gemini_llm.invoke([HumanMessage(content=prompt)]).content.strip()
+            print(f"[CACHE_SYSTEM] LLM response preview: {response[:200]}...")
+            
+            # Check if LLM returned NULL
+            if response.upper().strip() == "NULL":
+                print(f"[CACHE_SYSTEM] LLM determined cached answer cannot answer the query")
+                return None
+            
+            # Return the reframed answer
+            print(f"[CACHE_SYSTEM] LLM provided reframed answer")
+            return response
+            
+        except Exception as e:
+            print(f"[CACHE_SYSTEM] Combined verification and reframing failed: {e}")
+            # Fallback: return None to trigger RAG pipeline
+            print(f"[CACHE_SYSTEM] Falling back to RAG pipeline")
+            return None
+
+# Global cache system
+cache_system: CacheSystem = None
 
 # -------------------- MAIN PIPELINE (called by API) --------------------
 async def medical_pipeline_api(user_id: str, user_message: str, background_tasks: BackgroundTasks) -> Dict[str, Any]:
@@ -1162,17 +1315,64 @@ async def medical_pipeline_api(user_id: str, user_message: str, background_tasks
 
     # Skip the old reformulation step since it's now combined above
 
-
+    # ---- CACHE CHECK (NEW: BERT + LLM APPROACH) ----
+    print("[pipeline] Step 3: Cache check using BERT + LLM verification...")
+    cached_answer = None
+    if cache_system:
+        cache_start = time.perf_counter()
+        cached_answer = cache_system.check_cache(rewritten)
+        cache_end = time.perf_counter()
+        print(f"[pipeline] Cache check took {cache_end - cache_start:.3f} seconds")
+    
+    if cached_answer:
+        print("[pipeline] CACHE HIT! Skipping RAG pipeline...")
+        
+        # Apply correction prefix if needed
+        if label != "FOLLOW_UP" and correction:
+            correction_msg = "I guess you meant " + " and ".join(correction.values())
+            cached_answer = correction_msg + "\n" + cached_answer
+        
+        # Find relevant video URL for cached answer
+        print("[pipeline] Step 4: Finding relevant video for cached answer...")
+        video_url = None
+        if video_system:
+            video_start = time.perf_counter()
+            video_url = video_system.find_relevant_video(cached_answer)
+            video_end = time.perf_counter()
+            print(f"[pipeline] Video matching took {video_end - video_start:.3f} secs")
+            if video_url:
+                print(f"[pipeline] Found relevant video: {video_url}")
+            else:
+                print("[pipeline] No relevant video found")
+        
+        # Schedule background save for cached answer
+        print("[pipeline] schedule background save: cached_answer")
+        background_tasks.add_task(_background_update_and_save, user_id, user_message, cached_answer, "answer", history_pairs, current_summary)
+        print("[pipeline] done with cached answer")
+        t_end = time.perf_counter()
+        timer.total("request")
+        print(f"total took {t_end - start_time:.2f} secs")
+        
+        # Return cached response with video URL
+        response = {"answer": cached_answer, "intent": "answer", "follow_up": None}
+        if video_url:
+            response["video_url"] = video_url
+        else:
+            response["video_url"] = None
+        
+        return response
+    
+    print("[pipeline] CACHE MISS! Proceeding with RAG pipeline...")
 
     # ---- HYBRID RETRIEVAL ----
-    print("[pipeline] Step 3: hybrid_retrieve")
+    print("[pipeline] Step 4: hybrid_retrieve")
     candidates = hybrid_retrieve(rewritten)   # vector + bm25 + rerank
     t4 = time.perf_counter()
     timer.mark("hybrid_retrieve")
     print(f"retrieval took {t4 - t3:.2f} secs")
     print(f"[pipeline] retrieved {len(candidates)} candidates")
 
-    print("[pipeline] Step 4: judge_sufficiency")
+    print("[pipeline] Step 5: judge_sufficiency")
     judge = judge_sufficiency(rewritten, candidates)
     t5 = time.perf_counter()
     timer.mark("judge_sufficiency")
@@ -1190,7 +1390,7 @@ async def medical_pipeline_api(user_id: str, user_message: str, background_tasks
             sec = fc["meta"].get("section") if fc.get("meta") else None
             followup_q = sec or (fc["text"])
 
-        print("[pipeline] Step 5: synthesize_answer")
+        print("[pipeline] Step 6: synthesize_answer")
         answer = synthesize_answer(rewritten, top4, followup_q, gemini_llm)
         t6 = time.perf_counter()
         timer.mark("synthesize_answer")
@@ -1202,7 +1402,7 @@ async def medical_pipeline_api(user_id: str, user_message: str, background_tasks
             answer = correction_msg + "\n" + answer
         
         # Find relevant video URL
-        print("[pipeline] Step 6: Finding relevant video...")
+        print("[pipeline] Step 7: Finding relevant video...")
         video_url = None
         if video_system:
             video_start = time.perf_counter()
@@ -1251,7 +1451,7 @@ async def medical_pipeline_api(user_id: str, user_message: str, background_tasks
 # -------------------- API ENDPOINTS --------------------
 @app.on_event("startup")
 async def startup_event():
-    global embedding_model, reranker, pinecone_index, llm, summarizer_llm, reformulate_llm, classifier_llm, gemini_llm, EMBED_DIM, video_system
+    global embedding_model, reranker, pinecone_index, llm, summarizer_llm, reformulate_llm, classifier_llm, gemini_llm, EMBED_DIM, video_system, cache_system
     print("[startup] Initializing models and Pinecone client...")
     t = CheckpointTimer("startup")
     embedding_model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
@@ -1286,6 +1486,11 @@ async def startup_event():
     # Initialize Gemini for ALL LLM tasks (classification, reformulation, judging, synthesis, chitchat)
     gemini_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", api_key=GOOGLE_API_KEY)
     t.mark("init_llms")
+
+    # Initialize cache system
+    print("[startup] Initializing cache system...")
+    cache_system = CacheSystem()
+    t.mark("init_cache_system")
 
     # Initialize video matching system
     print("[startup] Initializing video matching system...")
