@@ -989,162 +989,125 @@ def handle_chitchat(user_message: str, chat_history: str) -> str:
         print(f"[chitchat] Gemini LLM failed: {e}")
         return "Whoa, let's keep it polite, please! 😊"
 
-# -------------------- VIDEO MATCHING SYSTEM --------------------
+# -------------------- VIDEO MATCHING SYSTEM (SIMPLIFIED BERT APPROACH) --------------------
 class VideoMatchingSystem:
     def __init__(self, video_file_path: str = "D:\\RHL-WH\\RHL-FASTAPI\\FILES\\video_link_topic.xlsx"):
-        """Initialize the video matching system"""
+        """Initialize the simplified video matching system using BERT similarity"""
         self.video_file_path = video_file_path
-        self.topic_dict = {}  # topic -> index
-        self.url_dict = {}    # index -> URL
+        self.topic_list = []  # List of topic strings
+        self.url_list = []    # List of corresponding URLs
         
         # Load video data
         self._load_video_data()
+        
+        # Initialize BERT model for similarity
+        print("[VIDEO_SYSTEM] Loading BERT model for semantic similarity...")
+        self.similarity_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+        print("[VIDEO_SYSTEM] BERT model loaded successfully")
     
     def _load_video_data(self):
-        """Load and preprocess video data"""
+        """Load and preprocess video data into simple lists using Description column"""
         try:
             df = pd.read_excel(self.video_file_path)
             print(f"[VIDEO_SYSTEM] Loaded {len(df)} videos from {self.video_file_path}")
             
-            # Create dictionaries
+            # Create simple lists using Description column instead of video_topic
             for idx, row in df.iterrows():
-                topic = row['video_topic'].strip()
+                description = row['Description'].strip()
                 url = row['URL'].strip()
                 
-                if topic and url:
-                    self.topic_dict[topic] = idx
-                    self.url_dict[idx] = url
+                if description and url:
+                    self.topic_list.append(description)
+                    self.url_list.append(url)
             
-            print(f"[VIDEO_SYSTEM] Created topic_dict with {len(self.topic_dict)} topics")
+            print(f"[VIDEO_SYSTEM] Created description_list with {len(self.topic_list)} descriptions")
+            print(f"[VIDEO_SYSTEM] Sample descriptions:")
+            for i, desc in enumerate(self.topic_list[:3]):
+                print(f"  {i}: {desc[:100]}...")
             
         except Exception as e:
             print(f"[VIDEO_SYSTEM] Error loading video data: {e}")
-            self.topic_dict = {}
-            self.url_dict = {}
-    
-    def pre_filter_topics(self, answer: str, min_matches: int = 4) -> List[Tuple[int, int]]:
-        """Strict word matching to reduce candidates - only highly relevant topics"""
-        candidates = []
-        answer_words = set(answer.lower().split())
-        
-        # Remove common words that don't add meaning
-        stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'can', 'must', 'this', 'that', 'these', 'those', 'i', 'you', 'he', 'she', 'it', 'we', 'they', 'me', 'him', 'her', 'us', 'them'}
-        answer_words = answer_words - stop_words
-        
-        for topic, idx in self.topic_dict.items():
-            # Split topic by comma and get individual words
-            topic_words = set()
-            for term in topic.split(','):
-                topic_words.update(term.strip().lower().split())
-            
-            # Remove stop words from topic words too
-            topic_words = topic_words - stop_words
-            
-            # Count matches
-            matches = len(answer_words.intersection(topic_words))
-            
-            # Much stricter criteria: need at least 4 meaningful word matches
-            if matches >= min_matches:
-                candidates.append((idx, matches))
-        
-        # Sort by matches (descending)
-        candidates.sort(key=lambda x: x[1], reverse=True)
-        return candidates
-    
-    def llm_score_candidates(self, answer: str, candidates: List[Tuple[int, int]]) -> Optional[int]:
-        """Use Gemini to score top candidates"""
-        if len(candidates) <= 1:
-            return candidates[0][0] if candidates else None
-        
-        # Create prompt with top candidates
-        topic_list = []
-        for idx, matches in candidates[:10]:  # Limit to top 10 for efficiency
-            topic = list(self.topic_dict.keys())[list(self.topic_dict.values()).index(idx)]
-            topic_list.append(f"{idx}: {topic}")
-        
-        prompt = f"""Score these video topics against the medical answer (0-100 each):
-
-Answer: {answer}
-
-Topics:
-{chr(10).join(topic_list)}
-
-IMPORTANT: Only give high scores (80+) if the video topic is DIRECTLY and STRONGLY related to the medical answer. 
-- 90-100: Perfect match, video directly addresses the answer topic
-- 80-89: Strong match, video covers the same medical condition/treatment
-- 70-79: Moderate match, video is somewhat related
-- 60-69: Weak match, video has some connection
-- 0-59: No meaningful connection
-
-Return JSON: {{"scores": [85, 92, 45, ...]}}"""
-        
-        try:
-            response = gemini_llm.invoke([HumanMessage(content=prompt)]).content
-            
-            # Parse JSON response
-            try:
-                # Extract JSON from response
-                json_start = response.find('{')
-                json_end = response.rfind('}') + 1
-                if json_start != -1 and json_end > json_start:
-                    json_str = response[json_start:json_end]
-                    scores_data = json.loads(json_str)
-                    scores = scores_data.get('scores', [])
-                    
-                    if scores and len(scores) == len(candidates[:10]):
-                        # Find best score
-                        best_score = max(scores)
-                        best_score_idx = scores.index(best_score)
-                        best_candidate_idx = candidates[best_score_idx][0]
-                        
-                        # Only return if score is high enough (80+ for strong relevance)
-                        if best_score >= 80:
-                            print(f"[VIDEO_SYSTEM] Best score: {best_score} (meets threshold)")
-                            return best_candidate_idx
-                        else:
-                            print(f"[VIDEO_SYSTEM] Best score: {best_score} (below 80 threshold, no video)")
-                            return None
-                        
-            except Exception as e:
-                print(f"[VIDEO_SYSTEM] Error parsing LLM response: {e}")
-                
-        except Exception as e:
-            print(f"[VIDEO_SYSTEM] LLM call failed: {e}")
-        
-        # Fallback to first candidate
-        return candidates[0][0] if candidates else None
+            self.topic_list = []
+            self.url_list = []
     
     def find_relevant_video(self, answer: str) -> Optional[str]:
-        """Find relevant video URL for the answer - STRICT MATCHING ONLY"""
-        if not self.topic_dict:
+        """Find relevant video using BERT similarity + LLM verification"""
+        if not self.topic_list:
             return None
         
         print(f"[VIDEO_SYSTEM] Searching for video for answer: {answer[:100]}...")
         
-        # Step 1: Pre-filtering (strict - need 4+ meaningful word matches)
-        candidates = self.pre_filter_topics(answer, min_matches=4)
+        # Step 1: BERT Semantic Similarity
+        print("[VIDEO_SYSTEM] Step 1: Computing BERT semantic similarities...")
+        bert_start = time.perf_counter()
         
-        if not candidates:
-            print("[VIDEO_SYSTEM] No candidates found with 4+ meaningful word matches")
-            return None
+        # Encode answer and all topics
+        answer_embedding = self.similarity_model.encode([answer])
+        topic_embeddings = self.similarity_model.encode(self.topic_list)
         
-        print(f"[VIDEO_SYSTEM] Found {len(candidates)} candidates after pre-filtering")
+        # Compute cosine similarities
+        similarities = cosine_similarity(answer_embedding, topic_embeddings)[0]
         
-        # Step 2: LLM scoring (if multiple candidates)
-        if len(candidates) == 1:
-            # For single candidate, still use LLM to verify relevance
-            best_idx = self.llm_score_candidates(answer, candidates)
+        # Find best match
+        best_idx = np.argmax(similarities)
+        best_similarity = similarities[best_idx]
+        
+        bert_end = time.perf_counter()
+        print(f"[VIDEO_SYSTEM] BERT similarity computation took {bert_end - bert_start:.3f} seconds")
+        print(f"[VIDEO_SYSTEM] Best similarity score: {best_similarity:.3f}")
+        print(f"[VIDEO_SYSTEM] Best description: {self.topic_list[best_idx][:100]}...")
+        
+        # Step 2: LLM Verification (only for top match)
+        if best_similarity >= 0.3:  # Threshold for semantic similarity
+            print("[VIDEO_SYSTEM] Step 2: LLM verification of top match...")
+            llm_start = time.perf_counter()
+            
+            verification_result = self._verify_with_llm(answer, self.topic_list[best_idx])
+            
+            llm_end = time.perf_counter()
+            print(f"[VIDEO_SYSTEM] LLM verification took {llm_end - llm_start:.3f} seconds")
+            print(f"[VIDEO_SYSTEM] LLM verification result: {verification_result}")
+            
+            if verification_result:
+                video_url = self.url_list[best_idx]
+                print(f"[VIDEO_SYSTEM] Found relevant video: {video_url}")
+                return video_url
+            else:
+                print("[VIDEO_SYSTEM] LLM verification failed - no video")
+                return None
         else:
-            best_idx = self.llm_score_candidates(answer, candidates)
-        
-        # Step 3: Get URL only if we have a valid, high-scoring match
-        if best_idx is not None and best_idx in self.url_dict:
-            video_url = self.url_dict[best_idx]
-            print(f"[VIDEO_SYSTEM] Found relevant video: {video_url}")
-            return video_url
-        else:
-            print("[VIDEO_SYSTEM] No video found - no high-relevance matches")
+            print(f"[VIDEO_SYSTEM] Similarity score {best_similarity:.3f} below threshold 0.3 - no video")
             return None
+    
+    def _verify_with_llm(self, answer: str, description: str) -> bool:
+        """Use Gemini to verify if the video description is contextually relevant to the answer"""
+        prompt = f"""Analyze if the video description is contextually relevant to the medical answer.
+
+Medical Answer: {answer}
+
+Video Description: {description}
+
+Question: Is this video description DIRECTLY and STRONGLY related to the medical answer?
+
+Rules:
+- Return "YES" only if the video description directly addresses the same medical condition, procedure, or treatment mentioned in the answer
+- Return "NO" if the description is related but not directly relevant (e.g., general care vs specific procedure)
+- Return "NO" if the description is about a different medical condition entirely
+
+Examples:
+- Answer about "eye care for newborns" + Description "video about applying eye medication to prevent infections" → YES
+- Answer about "eye care for newborns" + Description "video about umbilical cord care procedures" → NO
+- Answer about "temperature measurement" + Description "video about using thermometer to check baby temperature" → YES
+
+Response (YES/NO only):"""
+
+        try:
+            response = gemini_llm.invoke([HumanMessage(content=prompt)]).content.strip().upper()
+            print(f"[VIDEO_SYSTEM] LLM response: {response}")
+            return response == "YES"
+        except Exception as e:
+            print(f"[VIDEO_SYSTEM] LLM verification failed: {e}")
+            return False
 
 # Global video matching system
 video_system: VideoMatchingSystem = None
