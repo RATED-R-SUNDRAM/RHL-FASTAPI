@@ -23,6 +23,9 @@ from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 from typing import Optional
+import pandas as pd
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
 
 
 # -------------------- CONFIG --------------------
@@ -471,6 +474,7 @@ Rules:
     - Always answer ONLY from <context> provided below which caters to the query. 
     - NEVER use the web, external sources, or prior knowledge outside the given context. 
     - Always consider query and answer in relevance to it.
+    - Be Very PRECISE AND TO THE POINT ABOUT WHAT IS ASKED IN THE QUERY AND ANSWER SHOULD BE STRICTLY IN THE CONTEXT PROVIDED AND NOT ANYTHING ELSE.
     - ANSWER STRICTLY IN 150-200 WORDS (USING BULLET AND SUB-BULLET POINTS [MAX 5-6 POINTS]) which encapusaltes the key points and information from the context to answer the query in an APT FLOW
     - Always follow below mentioned rules at all times : 
             • Begin each answer with: **"According to <source>"** (extract filename from metadata if available **DONT MENTION EXTENSIONS** eg, According to abc✅(correct), According to xyz.pdf❌(incorrect)). 
@@ -985,6 +989,166 @@ def handle_chitchat(user_message: str, chat_history: str) -> str:
         print(f"[chitchat] Gemini LLM failed: {e}")
         return "Whoa, let's keep it polite, please! 😊"
 
+# -------------------- VIDEO MATCHING SYSTEM --------------------
+class VideoMatchingSystem:
+    def __init__(self, video_file_path: str = "D:\\RHL-WH\\RHL-FASTAPI\\FILES\\video_link_topic.xlsx"):
+        """Initialize the video matching system"""
+        self.video_file_path = video_file_path
+        self.topic_dict = {}  # topic -> index
+        self.url_dict = {}    # index -> URL
+        
+        # Load video data
+        self._load_video_data()
+    
+    def _load_video_data(self):
+        """Load and preprocess video data"""
+        try:
+            df = pd.read_excel(self.video_file_path)
+            print(f"[VIDEO_SYSTEM] Loaded {len(df)} videos from {self.video_file_path}")
+            
+            # Create dictionaries
+            for idx, row in df.iterrows():
+                topic = row['video_topic'].strip()
+                url = row['URL'].strip()
+                
+                if topic and url:
+                    self.topic_dict[topic] = idx
+                    self.url_dict[idx] = url
+            
+            print(f"[VIDEO_SYSTEM] Created topic_dict with {len(self.topic_dict)} topics")
+            
+        except Exception as e:
+            print(f"[VIDEO_SYSTEM] Error loading video data: {e}")
+            self.topic_dict = {}
+            self.url_dict = {}
+    
+    def pre_filter_topics(self, answer: str, min_matches: int = 4) -> List[Tuple[int, int]]:
+        """Strict word matching to reduce candidates - only highly relevant topics"""
+        candidates = []
+        answer_words = set(answer.lower().split())
+        
+        # Remove common words that don't add meaning
+        stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'can', 'must', 'this', 'that', 'these', 'those', 'i', 'you', 'he', 'she', 'it', 'we', 'they', 'me', 'him', 'her', 'us', 'them'}
+        answer_words = answer_words - stop_words
+        
+        for topic, idx in self.topic_dict.items():
+            # Split topic by comma and get individual words
+            topic_words = set()
+            for term in topic.split(','):
+                topic_words.update(term.strip().lower().split())
+            
+            # Remove stop words from topic words too
+            topic_words = topic_words - stop_words
+            
+            # Count matches
+            matches = len(answer_words.intersection(topic_words))
+            
+            # Much stricter criteria: need at least 4 meaningful word matches
+            if matches >= min_matches:
+                candidates.append((idx, matches))
+        
+        # Sort by matches (descending)
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        return candidates
+    
+    def llm_score_candidates(self, answer: str, candidates: List[Tuple[int, int]]) -> Optional[int]:
+        """Use Gemini to score top candidates"""
+        if len(candidates) <= 1:
+            return candidates[0][0] if candidates else None
+        
+        # Create prompt with top candidates
+        topic_list = []
+        for idx, matches in candidates[:10]:  # Limit to top 10 for efficiency
+            topic = list(self.topic_dict.keys())[list(self.topic_dict.values()).index(idx)]
+            topic_list.append(f"{idx}: {topic}")
+        
+        prompt = f"""Score these video topics against the medical answer (0-100 each):
+
+Answer: {answer}
+
+Topics:
+{chr(10).join(topic_list)}
+
+IMPORTANT: Only give high scores (80+) if the video topic is DIRECTLY and STRONGLY related to the medical answer. 
+- 90-100: Perfect match, video directly addresses the answer topic
+- 80-89: Strong match, video covers the same medical condition/treatment
+- 70-79: Moderate match, video is somewhat related
+- 60-69: Weak match, video has some connection
+- 0-59: No meaningful connection
+
+Return JSON: {{"scores": [85, 92, 45, ...]}}"""
+        
+        try:
+            response = gemini_llm.invoke([HumanMessage(content=prompt)]).content
+            
+            # Parse JSON response
+            try:
+                # Extract JSON from response
+                json_start = response.find('{')
+                json_end = response.rfind('}') + 1
+                if json_start != -1 and json_end > json_start:
+                    json_str = response[json_start:json_end]
+                    scores_data = json.loads(json_str)
+                    scores = scores_data.get('scores', [])
+                    
+                    if scores and len(scores) == len(candidates[:10]):
+                        # Find best score
+                        best_score = max(scores)
+                        best_score_idx = scores.index(best_score)
+                        best_candidate_idx = candidates[best_score_idx][0]
+                        
+                        # Only return if score is high enough (80+ for strong relevance)
+                        if best_score >= 80:
+                            print(f"[VIDEO_SYSTEM] Best score: {best_score} (meets threshold)")
+                            return best_candidate_idx
+                        else:
+                            print(f"[VIDEO_SYSTEM] Best score: {best_score} (below 80 threshold, no video)")
+                            return None
+                        
+            except Exception as e:
+                print(f"[VIDEO_SYSTEM] Error parsing LLM response: {e}")
+                
+        except Exception as e:
+            print(f"[VIDEO_SYSTEM] LLM call failed: {e}")
+        
+        # Fallback to first candidate
+        return candidates[0][0] if candidates else None
+    
+    def find_relevant_video(self, answer: str) -> Optional[str]:
+        """Find relevant video URL for the answer - STRICT MATCHING ONLY"""
+        if not self.topic_dict:
+            return None
+        
+        print(f"[VIDEO_SYSTEM] Searching for video for answer: {answer[:100]}...")
+        
+        # Step 1: Pre-filtering (strict - need 4+ meaningful word matches)
+        candidates = self.pre_filter_topics(answer, min_matches=4)
+        
+        if not candidates:
+            print("[VIDEO_SYSTEM] No candidates found with 4+ meaningful word matches")
+            return None
+        
+        print(f"[VIDEO_SYSTEM] Found {len(candidates)} candidates after pre-filtering")
+        
+        # Step 2: LLM scoring (if multiple candidates)
+        if len(candidates) == 1:
+            # For single candidate, still use LLM to verify relevance
+            best_idx = self.llm_score_candidates(answer, candidates)
+        else:
+            best_idx = self.llm_score_candidates(answer, candidates)
+        
+        # Step 3: Get URL only if we have a valid, high-scoring match
+        if best_idx is not None and best_idx in self.url_dict:
+            video_url = self.url_dict[best_idx]
+            print(f"[VIDEO_SYSTEM] Found relevant video: {video_url}")
+            return video_url
+        else:
+            print("[VIDEO_SYSTEM] No video found - no high-relevance matches")
+            return None
+
+# Global video matching system
+video_system: VideoMatchingSystem = None
+
 # -------------------- MAIN PIPELINE (called by API) --------------------
 async def medical_pipeline_api(user_id: str, user_message: str, background_tasks: BackgroundTasks) -> Dict[str, Any]:
     print(f"[pipeline] Start user_id={user_id}, message={user_message[:50]}")
@@ -1073,6 +1237,20 @@ async def medical_pipeline_api(user_id: str, user_message: str, background_tasks
         if label != "FOLLOW_UP" and correction:
             correction_msg = "I guess you meant " + " and ".join(correction.values())
             answer = correction_msg + "\n" + answer
+        
+        # Find relevant video URL
+        print("[pipeline] Step 6: Finding relevant video...")
+        video_url = None
+        if video_system:
+            video_start = time.perf_counter()
+            video_url = video_system.find_relevant_video(answer)
+            video_end = time.perf_counter()
+            print(f"[pipeline] Video matching took {video_end - video_start:.3f} secs")
+            if video_url:
+                print(f"[pipeline] Found relevant video: {video_url}")
+            else:
+                print("[pipeline] No relevant video found")
+        
         # Schedule full update+save in background (do not run update_chat_history in request path)
         print("[pipeline] schedule background save: answer")
         background_tasks.add_task(_background_update_and_save, user_id, user_message, answer, "answer", history_pairs, current_summary)
@@ -1080,7 +1258,15 @@ async def medical_pipeline_api(user_id: str, user_message: str, background_tasks
         t_end = time.perf_counter()
         timer.total("request")
         print(f"total took {t_end - start_time:.2f} secs")
-        return {"answer": answer, "intent": "answer", "follow_up": followup_q if followup_q else None}
+        
+        # Return response with video URL
+        response = {"answer": answer, "intent": "answer", "follow_up": followup_q if followup_q else None}
+        if video_url:
+            response["video_url"] = video_url
+        else:
+            response["video_url"] = None
+        
+        return response
 
     else:
         msg = (
@@ -1094,13 +1280,15 @@ async def medical_pipeline_api(user_id: str, user_message: str, background_tasks
         t_end = time.perf_counter()
         timer.total("request")
         print(f"total took {t_end - start_time:.2f} secs")
-        return {"answer": msg, "intent": "no_context", "follow_up": None}
+        
+        # Return response with video URL (None for no_context)
+        return {"answer": msg, "intent": "no_context", "follow_up": None, "video_url": None}
 
 
 # -------------------- API ENDPOINTS --------------------
 @app.on_event("startup")
 async def startup_event():
-    global embedding_model, reranker, pinecone_index, llm, summarizer_llm, reformulate_llm, classifier_llm, gemini_llm, EMBED_DIM
+    global embedding_model, reranker, pinecone_index, llm, summarizer_llm, reformulate_llm, classifier_llm, gemini_llm, EMBED_DIM, video_system
     print("[startup] Initializing models and Pinecone client...")
     t = CheckpointTimer("startup")
     embedding_model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
@@ -1135,6 +1323,11 @@ async def startup_event():
     # Initialize Gemini for ALL LLM tasks (classification, reformulation, judging, synthesis, chitchat)
     gemini_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", api_key=GOOGLE_API_KEY)
     t.mark("init_llms")
+
+    # Initialize video matching system
+    print("[startup] Initializing video matching system...")
+    video_system = VideoMatchingSystem()
+    t.mark("init_video_system")
 
     await init_db()
     t.mark("init_db")

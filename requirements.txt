@@ -14,3 +14,7 @@ unstructured
 pdfminer
 aiosqlite
 langchain-google-genai
+pandas
+numpy
+scikit-learn
+openpyxl
