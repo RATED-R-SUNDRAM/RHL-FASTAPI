@@ -487,7 +487,7 @@ Rules:
     - Always include a follow up question 
          - if <context_followup> is non-empty in the format(without bullet points) "Would you like to know about <a follow up question STRICTLY from context_followup not overlapping with the answer generated>?"
          - The genrated follow up should be about a medical topic and not any general topic(eg.Clinical Reference Manual for Advanced Neonatal Care in Ethiopia?" ❌) STRICTLY from context_followup
-
+    - THE FRAMING OF ANSWER SHOULD BE AT PROFESSIONAL EXPERT OF ENGLISH AND THE PERFECT FLOW OF ALL INFORMATION SHOULD MAKE SENSE AND NOT BE RANDOM SPITTING OF INFORMATION.
     - STRICTLY ADHERE TO THE WORD LIMIT AND BULLET POINT RULES and not fetching any information from the web or general knowledge or prior knowledge or any other sources.
 
 Example :  Query : what is cure for dispesion? 
@@ -991,7 +991,7 @@ def handle_chitchat(user_message: str, chat_history: str) -> str:
 
 # -------------------- VIDEO MATCHING SYSTEM (SIMPLIFIED BERT APPROACH) --------------------
 class VideoMatchingSystem:
-    def __init__(self, video_file_path: str = "D:\\RHL-WH\\RHL-FASTAPI\\FILES\\video_link_topic.xlsx"):
+    def __init__(self, video_file_path: str = "./FILES/video_link_topic.xlsx"):
         """Initialize the simplified video matching system using BERT similarity"""
         self.video_file_path = video_file_path
         self.topic_list = []  # List of topic strings
@@ -1081,11 +1081,9 @@ class VideoMatchingSystem:
     
     def _verify_with_llm(self, answer: str, description: str) -> bool:
         """Use Gemini to verify if the video description is contextually relevant to the answer"""
-        prompt = f"""Analyze if the video description is contextually relevant to the medical answer.
+        prompt = f"""Analyze if the video description majorly aligns with the medical answer with referance to the below rules
 
-Medical Answer: {answer}
 
-Video Description: {description}
 
 Question: Is this video description DIRECTLY and STRONGLY related to the medical answer?
 
@@ -1098,7 +1096,9 @@ Examples:
 - Answer about "eye care for newborns" + Description "video about applying eye medication to prevent infections" → YES
 - Answer about "eye care for newborns" + Description "video about umbilical cord care procedures" → NO
 - Answer about "temperature measurement" + Description "video about using thermometer to check baby temperature" → YES
+Medical Answer: ```{answer}```
 
+Video Description: ```{description}```
 Response (YES/NO only):"""
 
         try:
@@ -1111,7 +1111,7 @@ Response (YES/NO only):"""
 
 # -------------------- CACHE SYSTEM (BERT + LLM APPROACH) --------------------
 class CacheSystem:
-    def __init__(self, cache_file_path: str = "D:\\RHL-WH\\RHL-FASTAPI\\FILES\\cache_questions.xlsx"):
+    def __init__(self, cache_file_path: str = "./FILES/cache_questions.xlsx"):
         """Initialize the cache system using BERT similarity + LLM verification"""
         self.cache_file_path = cache_file_path
         self.question_list = []  # List of cached questions
@@ -1185,7 +1185,7 @@ class CacheSystem:
         print(f"[CACHE_SYSTEM] Best cached question: {self.question_list[best_idx][:100]}...")
         
         # Step 2: Combined LLM Verification + Reframing (only for top match)
-        if best_similarity >= 0.4:  # Higher threshold for cache (more strict)
+        if best_similarity >= 0.6:  # Higher threshold for cache (more strict)
             print("[CACHE_SYSTEM] Step 2: Combined LLM verification and reframing...")
             llm_start = time.perf_counter()
             
