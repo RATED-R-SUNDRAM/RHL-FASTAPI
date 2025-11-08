@@ -265,6 +265,7 @@ IMPORTANT: For MEDICAL_QUESTION and FOLLOW_UP (not CHITCHAT), also generate a "s
 
 CLASSIFICATION RULES:
 - MEDICAL_QUESTION: any standalone question about medical facts, diagnoses, treatments, NEWBORN CARE, or women's health
+- MEDICAL_QUESTION : Even if user asks multiple times about the same MEDICAL TOPIC, it should be considered as a MEDICAL_QUESTION
 - FOLLOW_UP: short responses to previous assistant suggestions (yes, sure, prevention please, etc.)
 - CHITCHAT: greetings, thanks, smalltalk, profanity, non-medical topics, or explicit "stop" requests OR ANYTHING WHICH IS NON-MEDICAL OR NON_FOLLOWUP
 
@@ -523,10 +524,12 @@ STEP 3 - ANSWER FORMATTING:
 - Begin with: **"According to <source(s)>"** (extract filename, NO extensions)
   - Single source: "According to abc"
   - Multiple sources: "According to abc, def, ghi"
-- Use bullet and sub-bullet points (4-5 if sufficient info, minimum 3)
+- BE VERY PRECISE AND CONCISE IN ANSWER FRAMING STRUICTLY ANSWER WHAT HAS BEEN ASKED (STRICTLY FROM THE CONTEXT PROVIDED AND NOT FROM OPEN WEB) IN MAXIUMUM OF 150-200 WORDS (SO CHOOSE WISELY) AND AVOID PROVIDING IRRELEVANT INFORMATION 
+- Use bullet and sub-bullet points (MAXIMUM 5 POINTS MINIMUM)
 - Each bullet should be a complete, meaningful point
 - Combine related information from multiple sources into single bullets
 - Ensure logical flow: Related points should be adjacent
+
 
 STEP 4 - FOLLOW-UP QUESTION (MANDATORY IF context_followup PROVIDED):
 - If <context_followup> is non-empty, you MUST include a follow-up question
@@ -582,6 +585,14 @@ According to symptom_guide, clinical_manual, treatment_guide:
 • Itchy skin (pruritus) may occur in some cases
 
 ---
+Example 4 - Precise Answer Formatting:
+Query: "Oxytocin dosage"
+
+Expected answer : * The recommended dosage for postpartum hemorrhage management is 10 IU by IM/IV bolus injection, administered slowly over 1-2 minutes if IV access is available. ✅
+                  * For induction or augmentation of labor, oxytocin can be infused at a concentration of 2.5 units in 500 mL of dextrose or normal saline, starting at 2.5 mIU per minute and increasing by 2.5 mIU per minute every 30 minutes until a good contraction pattern is established. ✅
+
+Not Expected answer : * Oxytocin is an injectable uterotonic drug used to cause uterine contractions, assisting in the separation of the placenta and stopping postpartum bleeding.. ❌
+                     *  It is recommended for actively managing the third stage of labor and should be given within one minute of the birth of the last baby. ❌
 
 Example 3 - Multi-Source Consolidation (WRONG - DON'T DO THIS):
 Query: "What are the symptoms of jaundice?"
