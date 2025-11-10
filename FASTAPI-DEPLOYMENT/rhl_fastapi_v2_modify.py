@@ -266,7 +266,7 @@ IMPORTANT: For MEDICAL_QUESTION and FOLLOW_UP (not CHITCHAT), also generate a "s
 CLASSIFICATION RULES:
 - MEDICAL_QUESTION: any standalone question about medical facts, diagnoses, treatments, NEWBORN CARE, or women's health
 - MEDICAL_QUESTION : Even if user asks multiple times about the same MEDICAL TOPIC, it should be considered as a MEDICAL_QUESTION
-- FOLLOW_UP: short responses to previous assistant suggestions (yes, sure, prevention please, etc.) or followup up  symptoms, complications, procedures about previous answwer
+- FOLLOW_UP: short responses to previous assistant suggestions (yes, sure, prevention please, etc.)
 - CHITCHAT: greetings, thanks, smalltalk, profanity, non-medical topics, or explicit "stop" requests OR ANYTHING WHICH IS NON-MEDICAL OR NON_FOLLOWUP
 
 REFORMULATION RULES:
@@ -277,7 +277,6 @@ REFORMULATION RULES:
 - Correct spelling/abbreviations when meaning changes
 - Expand medical abbreviations (IUFD -> Intrauterine fetal death)
 - Keep rewritten_query concise and medically precise
-- If followup is symptoms, complication,procedure pair it with previous answer
 
 EXAMPLES:
 
