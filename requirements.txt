@@ -8,8 +8,9 @@ langchain-huggingface
 pinecone
 python-dotenv
 sentence-transformers
-fitz
-frontend
+pymupdf
+python-docx
+chromadb
 unstructured
 pdfminer
 aiosqlite
@@ -18,3 +19,4 @@ pandas
 numpy
 scikit-learn
 openpyxl
+flashrank

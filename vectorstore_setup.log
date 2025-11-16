@@ -1,0 +1,630 @@
+2025-11-16 17:04:56,030 � INFO � ============================================================
+2025-11-16 17:04:56,030 � INFO � LOCAL VECTOR STORE SETUP
+2025-11-16 17:04:56,030 � INFO � ============================================================
+2025-11-16 17:04:56,031 � INFO � Loading embedding model: sentence-transformers/all-mpnet-base-v2...
+2025-11-16 17:04:56,033 � INFO � Use pytorch device_name: cpu
+2025-11-16 17:04:56,033 � INFO � Load pretrained SentenceTransformer: sentence-transformers/all-mpnet-base-v2
+2025-11-16 17:04:59,471 � INFO � Initializing ChromaDB...
+2025-11-16 17:05:02,413 � INFO � ChromaDB initialized at: FILES\local_vectorstore
+2025-11-16 17:05:02,413 � INFO � Loaded manifest with 0 tracked files
+2025-11-16 17:05:02,414 � INFO � 
+File Summary:
+2025-11-16 17:05:02,414 � INFO �   Total files found: 14 (13 PDF, 1 DOCX)
+2025-11-16 17:05:02,415 � INFO �   Files to process: 14 (13 PDF, 1 DOCX)
+2025-11-16 17:05:02,415 � INFO �   Files unchanged (skipped): 0
+2025-11-16 17:05:02,415 � INFO � 
+============================================================
+2025-11-16 17:05:02,415 � INFO � STARTING FILE PROCESSING
+2025-11-16 17:05:02,415 � INFO � ============================================================
+
+2025-11-16 17:05:02,415 � INFO � 
+============================================================
+2025-11-16 17:05:02,416 � INFO � PROCESSING FILE 1/14: Bleeding after birth provider guide.pdf
+2025-11-16 17:05:02,416 � INFO � ============================================================
+2025-11-16 17:05:02,416 � INFO � [1/14] Processing: Bleeding after birth provider guide.pdf
+2025-11-16 17:05:02,416 � INFO �   [STAGE] Parsing PDF: Bleeding after birth provider guide.pdf
+2025-11-16 17:05:02,416 � INFO �   [STAGE] Opening PDF file...
+2025-11-16 17:05:02,419 � INFO �   [STAGE] PDF opened in 0.00s (76 pages)
+2025-11-16 17:05:04,062 � INFO �   [STAGE] Processed 10/76 pages (0.08s for page 10)
+2025-11-16 17:05:05,498 � INFO �   [STAGE] Processed 20/76 pages (0.18s for page 20)
+2025-11-16 17:05:07,211 � INFO �   [STAGE] Processed 30/76 pages (0.23s for page 30)
+2025-11-16 17:05:08,413 � INFO �   [STAGE] Processed 40/76 pages (0.22s for page 40)
+2025-11-16 17:05:10,539 � INFO �   [STAGE] Processed 50/76 pages (0.50s for page 50)
+2025-11-16 17:05:12,417 � INFO �   [STAGE] Processed 60/76 pages (0.24s for page 60)
+2025-11-16 17:05:13,753 � INFO �   [STAGE] Processed 70/76 pages (0.07s for page 70)
+2025-11-16 17:05:14,688 � INFO �   [STAGE] PDF extraction complete: 1233 elements in 12.27s
+2025-11-16 17:05:14,689 � INFO �   [STAGE] Document parsing complete in 12.27s
+2025-11-16 17:05:14,689 � INFO �   [STAGE] Extracted 1233 elements from Bleeding after birth provider guide.pdf
+2025-11-16 17:05:14,689 � INFO �   [STAGE] Starting chunking (chunk_size=1200, overlap=120)...
+2025-11-16 17:05:14,691 � INFO �   [STAGE] Collected 194 text blocks (including 6 tables) in 0.00s
+2025-11-16 17:05:14,702 � INFO �   [STAGE] Chunking complete: 233 chunks created in 0.01s (split: 0.01s)
+2025-11-16 17:05:14,703 � INFO �   [STAGE] Starting embedding & upsert: 233 chunks in 8 batches (batch_size=32)...
+2025-11-16 17:05:25,052 � INFO �     [BATCH 1/8] Encoded: 10.28s | Prepared: 0.00s | Upserted: 0.07s | Total: 10.35s | Chunks: 32
+2025-11-16 17:05:34,141 � INFO �     [BATCH 2/8] Encoded: 9.06s | Prepared: 0.00s | Upserted: 0.03s | Total: 9.09s | Chunks: 32
+2025-11-16 17:05:41,921 � INFO �     [BATCH 3/8] Encoded: 7.75s | Prepared: 0.00s | Upserted: 0.03s | Total: 7.78s | Chunks: 32
+2025-11-16 17:05:49,395 � INFO �     [BATCH 4/8] Encoded: 7.38s | Prepared: 0.00s | Upserted: 0.09s | Total: 7.47s | Chunks: 32
+2025-11-16 17:05:56,610 � INFO �     [BATCH 5/8] Encoded: 7.18s | Prepared: 0.00s | Upserted: 0.04s | Total: 7.21s | Chunks: 32
+2025-11-16 17:06:05,800 � INFO �     [BATCH 6/8] Encoded: 9.15s | Prepared: 0.00s | Upserted: 0.04s | Total: 9.19s | Chunks: 32
+2025-11-16 17:06:12,044 � INFO �     [BATCH 7/8] Encoded: 6.19s | Prepared: 0.00s | Upserted: 0.05s | Total: 6.24s | Chunks: 32
+2025-11-16 17:06:14,041 � INFO �     [BATCH 8/8] Encoded: 1.97s | Prepared: 0.00s | Upserted: 0.03s | Total: 2.00s | Chunks: 9
+2025-11-16 17:06:14,088 � INFO � 
+[PROGRESS] 1/14 files completed | 13 remaining
+
+2025-11-16 17:06:14,088 � INFO � 
+============================================================
+2025-11-16 17:06:14,088 � INFO � PROCESSING FILE 2/14: ENC-Assessment and Continuing Care.pdf
+2025-11-16 17:06:14,088 � INFO � ============================================================
+2025-11-16 17:06:14,089 � INFO � [2/14] Processing: ENC-Assessment and Continuing Care.pdf
+2025-11-16 17:06:14,089 � INFO �   [STAGE] Parsing PDF: ENC-Assessment and Continuing Care.pdf
+2025-11-16 17:06:14,089 � INFO �   [STAGE] Opening PDF file...
+2025-11-16 17:06:14,103 � INFO �   [STAGE] PDF opened in 0.01s (88 pages)
+2025-11-16 17:06:15,313 � INFO �   [STAGE] Processed 10/88 pages (0.20s for page 10)
+2025-11-16 17:06:16,895 � INFO �   [STAGE] Processed 20/88 pages (0.24s for page 20)
+2025-11-16 17:06:18,887 � INFO �   [STAGE] Processed 30/88 pages (0.61s for page 30)
+2025-11-16 17:06:21,414 � INFO �   [STAGE] Processed 40/88 pages (0.18s for page 40)
+2025-11-16 17:06:22,795 � INFO �   [STAGE] Processed 50/88 pages (0.16s for page 50)
+2025-11-16 17:06:24,782 � INFO �   [STAGE] Processed 60/88 pages (0.34s for page 60)
+2025-11-16 17:12:37,516 • INFO • ============================================================
+2025-11-16 17:12:37,517 • INFO • LOCAL VECTOR STORE SETUP
+2025-11-16 17:12:37,517 • INFO • ============================================================
+2025-11-16 17:12:37,517 • INFO • Loading embedding model: sentence-transformers/all-mpnet-base-v2...
+2025-11-16 17:12:37,518 • INFO • Use pytorch device_name: cpu
+2025-11-16 17:12:37,519 • INFO • Load pretrained SentenceTransformer: sentence-transformers/all-mpnet-base-v2
+2025-11-16 17:12:41,369 • INFO • [OK] Embedding model loaded (dim=768) in 3.85s
+2025-11-16 17:12:41,370 • INFO • Initializing ChromaDB...
+2025-11-16 17:12:41,541 • INFO • ChromaDB initialized at: FILES\local_vectorstore (collection has 233 chunks)
+2025-11-16 17:12:41,541 • INFO • Loaded manifest with 0 tracked files
+2025-11-16 17:12:41,542 • INFO • 
+File Summary:
+2025-11-16 17:12:41,542 • INFO •   Total files found: 14 (13 PDF, 1 DOCX)
+2025-11-16 17:12:41,542 • INFO •   Files to process: 14 (13 PDF, 1 DOCX)
+2025-11-16 17:12:41,542 • INFO •   Files unchanged (skipped): 0
+2025-11-16 17:12:41,542 • INFO • 
+============================================================
+2025-11-16 17:12:41,543 • INFO • STARTING FILE PROCESSING
+2025-11-16 17:12:41,543 • INFO • ============================================================
+
+2025-11-16 17:12:41,543 • INFO • 
+============================================================
+2025-11-16 17:12:41,543 • INFO • PROCESSING FILE 1/14: Bleeding after birth provider guide.pdf
+2025-11-16 17:12:41,543 • INFO • ============================================================
+2025-11-16 17:12:41,543 • INFO • [1/14] Processing: Bleeding after birth provider guide.pdf
+2025-11-16 17:12:41,544 • INFO •   [STAGE] Parsing PDF: Bleeding after birth provider guide.pdf
+2025-11-16 17:12:41,544 • INFO •   [STAGE] Opening PDF file...
+2025-11-16 17:12:41,546 • INFO •   [STAGE] PDF opened in 0.00s (76 pages)
+2025-11-16 17:12:44,560 • INFO •   [STAGE] Processed 10/76 pages (0.13s for page 10)
+2025-11-16 17:12:48,344 • INFO •   [STAGE] Processed 20/76 pages (0.53s for page 20)
+2025-11-16 17:12:51,975 • INFO •   [STAGE] Processed 30/76 pages (0.35s for page 30)
+2025-11-16 17:12:54,571 • INFO •   [STAGE] Processed 40/76 pages (0.37s for page 40)
+2025-11-16 17:12:58,808 • INFO •   [STAGE] Processed 50/76 pages (1.36s for page 50)
+2025-11-16 17:13:02,833 • INFO •   [STAGE] Processed 60/76 pages (0.53s for page 60)
+2025-11-16 17:13:06,009 • INFO •   [STAGE] Processed 70/76 pages (0.19s for page 70)
+2025-11-16 17:13:07,313 • INFO •   [STAGE] PDF extraction complete: 1233 elements in 25.77s
+2025-11-16 17:13:07,313 • INFO •   [STAGE] Table extraction: 6 successful, 0 failed (extracted as text)
+2025-11-16 17:13:07,314 • INFO •   [STAGE] Document parsing complete in 25.77s
+2025-11-16 17:13:07,314 • INFO •   [STAGE] Extracted 1233 elements from Bleeding after birth provider guide.pdf
+2025-11-16 17:13:07,314 • INFO •   [STAGE] Starting chunking (chunk_size=1200, overlap=120)...
+2025-11-16 17:13:07,316 • INFO •   [STAGE] Collected 194 text blocks (including 6 tables) in 0.00s
+2025-11-16 17:13:07,330 • INFO •   [STAGE] Chunking complete: 233 chunks created in 0.02s (split: 0.01s)
+2025-11-16 17:13:07,331 • INFO •   [STAGE] Starting embedding & upsert: 233 chunks in 8 batches (batch_size=32)...
+2025-11-16 17:13:17,073 • INFO •     [BATCH 1/8] Encoded: 9.70s | Prepared: 0.00s | Upserted: 0.04s | Total: 9.74s | Chunks: 32
+2025-11-16 17:13:26,717 • INFO •     [BATCH 2/8] Encoded: 9.60s | Prepared: 0.00s | Upserted: 0.04s | Total: 9.64s | Chunks: 32
+2025-11-16 17:13:35,462 • INFO •     [BATCH 3/8] Encoded: 8.68s | Prepared: 0.00s | Upserted: 0.07s | Total: 8.74s | Chunks: 32
+2025-11-16 17:13:42,822 • INFO •     [BATCH 4/8] Encoded: 7.29s | Prepared: 0.00s | Upserted: 0.06s | Total: 7.36s | Chunks: 32
+2025-11-16 17:13:52,264 • INFO •     [BATCH 5/8] Encoded: 9.38s | Prepared: 0.00s | Upserted: 0.06s | Total: 9.44s | Chunks: 32
+2025-11-16 17:14:03,241 • INFO •     [BATCH 6/8] Encoded: 10.91s | Prepared: 0.00s | Upserted: 0.07s | Total: 10.98s | Chunks: 32
+2025-11-16 17:14:10,435 • INFO •     [BATCH 7/8] Encoded: 7.13s | Prepared: 0.00s | Upserted: 0.06s | Total: 7.19s | Chunks: 32
+2025-11-16 17:14:12,525 • INFO •     [BATCH 8/8] Encoded: 2.06s | Prepared: 0.00s | Upserted: 0.03s | Total: 2.09s | Chunks: 9
+2025-11-16 17:14:12,525 • INFO •   [STAGE] [OK] Embedding & upsert complete: 233 chunks in 65.19s (avg 279.80ms/chunk)
+2025-11-16 17:14:12,551 • INFO •   [OK] Generated 233 chunks in 91.01s
+2025-11-16 17:14:12,551 • INFO •   [STAGE] [OK] File processing complete: Bleeding after birth provider guide.pdf in 91.01s total
+2025-11-16 17:14:12,552 • INFO • 
+[PROGRESS] 1/14 files completed | 13 remaining
+
+2025-11-16 17:14:12,552 • INFO • 
+============================================================
+2025-11-16 17:14:12,552 • INFO • PROCESSING FILE 2/14: ENC-Assessment and Continuing Care.pdf
+2025-11-16 17:14:12,552 • INFO • ============================================================
+2025-11-16 17:14:12,553 • INFO • [2/14] Processing: ENC-Assessment and Continuing Care.pdf
+2025-11-16 17:14:12,553 • INFO •   [STAGE] Parsing PDF: ENC-Assessment and Continuing Care.pdf
+2025-11-16 17:14:12,553 • INFO •   [STAGE] Opening PDF file...
+2025-11-16 17:14:12,554 • INFO •   [STAGE] PDF opened in 0.00s (88 pages)
+2025-11-16 17:14:15,132 • INFO •   [STAGE] Processed 10/88 pages (0.38s for page 10)
+2025-11-16 17:14:18,244 • INFO •   [STAGE] Processed 20/88 pages (0.59s for page 20)
+2025-11-16 17:14:22,069 • INFO •   [STAGE] Processed 30/88 pages (0.50s for page 30)
+2025-11-16 17:14:27,186 • INFO •   [STAGE] Processed 40/88 pages (0.42s for page 40)
+2025-11-16 17:14:31,271 • INFO •   [STAGE] Processed 50/88 pages (0.74s for page 50)
+2025-11-16 17:14:35,341 • INFO •   [STAGE] Processed 60/88 pages (0.62s for page 60)
+2025-11-16 17:14:40,318 • INFO •   [STAGE] Processed 70/88 pages (1.02s for page 70)
+2025-11-16 17:14:44,360 • INFO •   [STAGE] Processed 80/88 pages (0.44s for page 80)
+2025-11-16 17:14:46,398 • INFO •   [STAGE] PDF extraction complete: 1043 elements in 33.84s
+2025-11-16 17:14:46,398 • INFO •   [STAGE] Table extraction: 22 successful, 0 failed (extracted as text)
+2025-11-16 17:14:46,399 • INFO •   [STAGE] Document parsing complete in 33.85s
+2025-11-16 17:14:46,399 • INFO •   [STAGE] Extracted 1043 elements from ENC-Assessment and Continuing Care.pdf
+2025-11-16 17:14:46,399 • INFO •   [STAGE] Starting chunking (chunk_size=1200, overlap=120)...
+2025-11-16 17:14:46,400 • INFO •   [STAGE] Collected 153 text blocks (including 22 tables) in 0.00s
+2025-11-16 17:14:46,408 • INFO •   [STAGE] Chunking complete: 183 chunks created in 0.01s (split: 0.01s)
+2025-11-16 17:14:46,409 • INFO •   [STAGE] Starting embedding & upsert: 183 chunks in 6 batches (batch_size=32)...
+2025-11-16 17:14:56,970 • INFO •     [BATCH 1/6] Encoded: 10.51s | Prepared: 0.00s | Upserted: 0.05s | Total: 10.56s | Chunks: 32
+2025-11-16 17:15:04,036 • INFO •     [BATCH 2/6] Encoded: 7.00s | Prepared: 0.00s | Upserted: 0.06s | Total: 7.07s | Chunks: 32
+2025-11-16 17:15:11,144 • INFO •     [BATCH 3/6] Encoded: 7.06s | Prepared: 0.00s | Upserted: 0.05s | Total: 7.11s | Chunks: 32
+2025-11-16 17:15:18,344 • INFO •     [BATCH 4/6] Encoded: 7.12s | Prepared: 0.00s | Upserted: 0.07s | Total: 7.20s | Chunks: 32
+2025-11-16 17:15:26,316 • INFO •     [BATCH 5/6] Encoded: 7.91s | Prepared: 0.00s | Upserted: 0.06s | Total: 7.97s | Chunks: 32
+2025-11-16 17:15:33,867 • INFO •     [BATCH 6/6] Encoded: 7.46s | Prepared: 0.00s | Upserted: 0.09s | Total: 7.55s | Chunks: 23
+2025-11-16 17:15:33,867 • INFO •   [STAGE] [OK] Embedding & upsert complete: 183 chunks in 47.46s (avg 259.33ms/chunk)
+2025-11-16 17:15:33,934 • INFO •   [OK] Generated 183 chunks in 81.38s
+2025-11-16 17:15:33,934 • INFO •   [STAGE] [OK] File processing complete: ENC-Assessment and Continuing Care.pdf in 81.38s total
+2025-11-16 17:15:33,935 • INFO • 
+[PROGRESS] 2/14 files completed | 12 remaining
+
+2025-11-16 17:15:33,935 • INFO • 
+============================================================
+2025-11-16 17:15:33,935 • INFO • PROCESSING FILE 3/14: ENC-Immediate Care and Helping Babies Breathe at Birth provider guide.pdf
+2025-11-16 17:15:33,936 • INFO • ============================================================
+2025-11-16 17:15:33,936 • INFO • [3/14] Processing: ENC-Immediate Care and Helping Babies Breathe at Birth provider guide.pdf
+2025-11-16 17:15:33,936 • INFO •   [STAGE] Parsing PDF: ENC-Immediate Care and Helping Babies Breathe at Birth provider guide.pdf
+2025-11-16 17:15:33,936 • INFO •   [STAGE] Opening PDF file...
+2025-11-16 17:15:33,939 • INFO •   [STAGE] PDF opened in 0.00s (64 pages)
+2025-11-16 17:15:37,461 • INFO •   [STAGE] Processed 10/64 pages (0.84s for page 10)
+2025-11-16 17:15:44,648 • INFO •   [STAGE] Processed 20/64 pages (0.51s for page 20)
+2025-11-16 17:15:49,514 • INFO •   [STAGE] Processed 30/64 pages (0.98s for page 30)
+2025-11-16 17:15:55,402 • INFO •   [STAGE] Processed 40/64 pages (0.69s for page 40)
+2025-11-16 17:16:00,139 • INFO •   [STAGE] Processed 50/64 pages (0.64s for page 50)
+2025-11-16 17:16:04,374 • INFO •   [STAGE] Processed 60/64 pages (0.25s for page 60)
+2025-11-16 17:16:05,265 • INFO •   [STAGE] PDF extraction complete: 727 elements in 31.33s
+2025-11-16 17:16:05,265 • INFO •   [STAGE] Table extraction: 12 successful, 0 failed (extracted as text)
+2025-11-16 17:16:05,266 • INFO •   [STAGE] Document parsing complete in 31.33s
+2025-11-16 17:16:05,266 • INFO •   [STAGE] Extracted 727 elements from ENC-Immediate Care and Helping Babies Breathe at Birth provider guide.pdf
+2025-11-16 17:16:05,266 • INFO •   [STAGE] Starting chunking (chunk_size=1200, overlap=120)...
+2025-11-16 17:16:05,267 • INFO •   [STAGE] Collected 99 text blocks (including 12 tables) in 0.00s
+2025-11-16 17:16:05,278 • INFO •   [STAGE] Chunking complete: 130 chunks created in 0.01s (split: 0.01s)
+2025-11-16 17:16:05,278 • INFO •   [STAGE] Starting embedding & upsert: 130 chunks in 5 batches (batch_size=32)...
+2025-11-16 17:16:16,143 • INFO •     [BATCH 1/5] Encoded: 10.79s | Prepared: 0.00s | Upserted: 0.07s | Total: 10.86s | Chunks: 32
+2025-11-16 17:16:24,294 • INFO •     [BATCH 2/5] Encoded: 8.07s | Prepared: 0.00s | Upserted: 0.08s | Total: 8.15s | Chunks: 32
+2025-11-16 17:16:33,463 • INFO •     [BATCH 3/5] Encoded: 9.08s | Prepared: 0.00s | Upserted: 0.08s | Total: 9.17s | Chunks: 32
+2025-11-16 17:16:44,488 • INFO •     [BATCH 4/5] Encoded: 10.94s | Prepared: 0.00s | Upserted: 0.08s | Total: 11.03s | Chunks: 32
+2025-11-16 17:16:45,168 • INFO •     [BATCH 5/5] Encoded: 0.64s | Prepared: 0.00s | Upserted: 0.04s | Total: 0.68s | Chunks: 2
+2025-11-16 17:16:45,168 • INFO •   [STAGE] [OK] Embedding & upsert complete: 130 chunks in 39.89s (avg 306.85ms/chunk)
+2025-11-16 17:16:45,213 • INFO •   [OK] Generated 130 chunks in 71.28s
+2025-11-16 17:16:45,213 • INFO •   [STAGE] [OK] File processing complete: ENC-Immediate Care and Helping Babies Breathe at Birth provider guide.pdf in 71.28s total
+2025-11-16 17:16:45,214 • INFO • 
+[PROGRESS] 3/14 files completed | 11 remaining
+
+2025-11-16 17:16:45,214 • INFO • 
+============================================================
+2025-11-16 17:16:45,215 • INFO • PROCESSING FILE 4/14: Essential Care for Labor and Birth provider guide.pdf
+2025-11-16 17:16:45,215 • INFO • ============================================================
+2025-11-16 17:16:45,215 • INFO • [4/14] Processing: Essential Care for Labor and Birth provider guide.pdf
+2025-11-16 17:16:45,215 • INFO •   [STAGE] Parsing PDF: Essential Care for Labor and Birth provider guide.pdf
+2025-11-16 17:16:45,215 • INFO •   [STAGE] Opening PDF file...
+2025-11-16 17:16:45,220 • INFO •   [STAGE] PDF opened in 0.00s (72 pages)
+2025-11-16 17:16:49,918 • INFO •   [STAGE] Processed 10/72 pages (1.86s for page 10)
+2025-11-16 17:16:57,525 • INFO •   [STAGE] Processed 20/72 pages (1.02s for page 20)
+2025-11-16 17:17:10,428 • INFO •   [STAGE] Processed 30/72 pages (3.22s for page 30)
+2025-11-16 17:17:21,454 • INFO •   [STAGE] Processed 40/72 pages (2.08s for page 40)
+2025-11-16 17:17:32,864 • INFO •   [STAGE] Processed 50/72 pages (1.13s for page 50)
+2025-11-16 17:17:42,376 • INFO •   [STAGE] Processed 60/72 pages (0.19s for page 60)
+2025-11-16 17:17:44,880 • INFO •   [STAGE] Processed 70/72 pages (0.25s for page 70)
+2025-11-16 17:17:50,350 • INFO •   [STAGE] PDF extraction complete: 1189 elements in 65.13s
+2025-11-16 17:17:50,351 • INFO •   [STAGE] Table extraction: 12 successful, 0 failed (extracted as text)
+2025-11-16 17:17:50,351 • INFO •   [STAGE] Document parsing complete in 65.14s
+2025-11-16 17:17:50,351 • INFO •   [STAGE] Extracted 1189 elements from Essential Care for Labor and Birth provider guide.pdf
+2025-11-16 17:17:50,351 • INFO •   [STAGE] Starting chunking (chunk_size=1200, overlap=120)...
+2025-11-16 17:17:50,353 • INFO •   [STAGE] Collected 144 text blocks (including 12 tables) in 0.00s
+2025-11-16 17:17:50,363 • INFO •   [STAGE] Chunking complete: 189 chunks created in 0.01s (split: 0.01s)
+2025-11-16 17:17:50,363 • INFO •   [STAGE] Starting embedding & upsert: 189 chunks in 6 batches (batch_size=32)...
+2025-11-16 17:18:01,133 • INFO •     [BATCH 1/6] Encoded: 10.69s | Prepared: 0.00s | Upserted: 0.08s | Total: 10.77s | Chunks: 32
+2025-11-16 17:18:08,975 • INFO •     [BATCH 2/6] Encoded: 7.76s | Prepared: 0.00s | Upserted: 0.08s | Total: 7.84s | Chunks: 32
+2025-11-16 17:18:17,618 • INFO •     [BATCH 3/6] Encoded: 8.57s | Prepared: 0.00s | Upserted: 0.08s | Total: 8.64s | Chunks: 32
+2025-11-16 17:18:28,464 • INFO •     [BATCH 4/6] Encoded: 10.76s | Prepared: 0.00s | Upserted: 0.09s | Total: 10.85s | Chunks: 32
+2025-11-16 17:18:39,126 • INFO •     [BATCH 5/6] Encoded: 10.58s | Prepared: 0.00s | Upserted: 0.08s | Total: 10.66s | Chunks: 32
+2025-11-16 17:18:49,303 • INFO •     [BATCH 6/6] Encoded: 10.08s | Prepared: 0.00s | Upserted: 0.10s | Total: 10.18s | Chunks: 29
+2025-11-16 17:18:49,304 • INFO •   [STAGE] [OK] Embedding & upsert complete: 189 chunks in 58.94s (avg 311.85ms/chunk)
+2025-11-16 17:18:49,370 • INFO •   [OK] Generated 189 chunks in 124.16s
+2025-11-16 17:18:49,371 • INFO •   [STAGE] [OK] File processing complete: Essential Care for Labor and Birth provider guide.pdf in 124.16s total
+2025-11-16 17:18:49,372 • INFO • 
+[PROGRESS] 4/14 files completed | 10 remaining
+
+2025-11-16 17:18:49,372 • INFO • 
+============================================================
+2025-11-16 17:18:49,373 • INFO • PROCESSING FILE 5/14: Managing Complications in pregnancy and childbirth, WHO.pdf
+2025-11-16 17:18:49,373 • INFO • ============================================================
+2025-11-16 17:18:49,373 • INFO • [5/14] Processing: Managing Complications in pregnancy and childbirth, WHO.pdf
+2025-11-16 17:18:49,373 • INFO •   [STAGE] Parsing PDF: Managing Complications in pregnancy and childbirth, WHO.pdf
+2025-11-16 17:18:49,373 • INFO •   [STAGE] Opening PDF file...
+2025-11-16 17:18:49,454 • INFO •   [STAGE] PDF opened in 0.08s (492 pages)
+2025-11-16 17:18:50,476 • INFO •   [STAGE] Processed 10/492 pages (0.14s for page 10)
+2025-11-16 17:18:51,104 • INFO •   [STAGE] Processed 20/492 pages (0.00s for page 20)
+2025-11-16 17:18:52,094 • INFO •   [STAGE] Processed 30/492 pages (0.11s for page 30)
+2025-11-16 17:18:53,024 • INFO •   [STAGE] Processed 40/492 pages (0.08s for page 40)
+2025-11-16 17:18:53,819 • INFO •   [STAGE] Processed 50/492 pages (0.03s for page 50)
+2025-11-16 17:18:54,806 • INFO •   [STAGE] Processed 60/492 pages (0.03s for page 60)
+2025-11-16 17:18:56,028 • INFO •   [STAGE] Processed 70/492 pages (0.12s for page 70)
+2025-11-16 17:18:57,112 • INFO •   [STAGE] Processed 80/492 pages (0.08s for page 80)
+2025-11-16 17:18:58,506 • INFO •   [STAGE] Processed 90/492 pages (0.16s for page 90)
+2025-11-16 17:18:59,360 • INFO •   [STAGE] Processed 100/492 pages (0.01s for page 100)
+2025-11-16 17:19:00,334 • INFO •   [STAGE] Processed 110/492 pages (0.10s for page 110)
+2025-11-16 17:19:01,880 • INFO •   [STAGE] Processed 120/492 pages (0.01s for page 120)
+2025-11-16 17:19:03,075 • INFO •   [STAGE] Processed 130/492 pages (0.19s for page 130)
+2025-11-16 17:19:03,824 • INFO •   [STAGE] Processed 140/492 pages (0.07s for page 140)
+2025-11-16 17:19:04,297 • INFO •   [STAGE] Processed 150/492 pages (0.05s for page 150)
+2025-11-16 17:19:06,694 • INFO •   [STAGE] Processed 160/492 pages (0.17s for page 160)
+2025-11-16 17:19:07,828 • INFO •   [STAGE] Processed 170/492 pages (0.05s for page 170)
+2025-11-16 17:19:09,451 • INFO •   [STAGE] Processed 180/492 pages (0.06s for page 180)
+2025-11-16 17:19:10,571 • INFO •   [STAGE] Processed 190/492 pages (0.13s for page 190)
+2025-11-16 17:19:12,029 • INFO •   [STAGE] Processed 200/492 pages (0.08s for page 200)
+2025-11-16 17:19:14,035 • INFO •   [STAGE] Processed 210/492 pages (0.20s for page 210)
+2025-11-16 17:19:15,180 • INFO •   [STAGE] Processed 220/492 pages (0.07s for page 220)
+2025-11-16 17:19:16,655 • INFO •   [STAGE] Processed 230/492 pages (0.04s for page 230)
+2025-11-16 17:19:17,945 • INFO •   [STAGE] Processed 240/492 pages (0.10s for page 240)
+2025-11-16 17:19:18,592 • INFO •   [STAGE] Processed 250/492 pages (0.01s for page 250)
+2025-11-16 17:19:20,047 • INFO •   [STAGE] Processed 260/492 pages (0.07s for page 260)
+2025-11-16 17:19:21,057 • INFO •   [STAGE] Processed 270/492 pages (0.03s for page 270)
+2025-11-16 17:19:22,920 • INFO •   [STAGE] Processed 280/492 pages (0.02s for page 280)
+2025-11-16 17:19:24,693 • INFO •   [STAGE] Processed 290/492 pages (0.05s for page 290)
+2025-11-16 17:19:26,269 • INFO •   [STAGE] Processed 300/492 pages (0.28s for page 300)
+2025-11-16 17:19:27,452 • INFO •   [STAGE] Processed 310/492 pages (0.11s for page 310)
+2025-11-16 17:19:28,886 • INFO •   [STAGE] Processed 320/492 pages (0.21s for page 320)
+2025-11-16 17:19:29,939 • INFO •   [STAGE] Processed 330/492 pages (0.00s for page 330)
+2025-11-16 17:19:31,079 • INFO •   [STAGE] Processed 340/492 pages (0.24s for page 340)
+2025-11-16 17:19:32,157 • INFO •   [STAGE] Processed 350/492 pages (0.12s for page 350)
+2025-11-16 17:19:34,078 • INFO •   [STAGE] Processed 360/492 pages (0.12s for page 360)
+2025-11-16 17:19:34,626 • INFO •   [STAGE] Processed 370/492 pages (0.07s for page 370)
+2025-11-16 17:19:35,322 • INFO •   [STAGE] Processed 380/492 pages (0.04s for page 380)
+2025-11-16 17:19:36,005 • INFO •   [STAGE] Processed 390/492 pages (0.04s for page 390)
+2025-11-16 17:19:36,627 • INFO •   [STAGE] Processed 400/492 pages (0.03s for page 400)
+2025-11-16 17:19:37,164 • INFO •   [STAGE] Processed 410/492 pages (0.08s for page 410)
+2025-11-16 17:19:37,641 • INFO •   [STAGE] Processed 420/492 pages (0.06s for page 420)
+2025-11-16 17:19:38,176 • INFO •   [STAGE] Processed 430/492 pages (0.02s for page 430)
+2025-11-16 17:19:38,869 • INFO •   [STAGE] Processed 440/492 pages (0.06s for page 440)
+2025-11-16 17:19:39,612 • INFO •   [STAGE] Processed 450/492 pages (0.04s for page 450)
+2025-11-16 17:19:40,021 • INFO •   [STAGE] Processed 460/492 pages (0.00s for page 460)
+2025-11-16 17:19:40,347 • INFO •   [STAGE] Processed 470/492 pages (0.00s for page 470)
+2025-11-16 17:19:40,955 • INFO •   [STAGE] Processed 480/492 pages (0.05s for page 480)
+2025-11-16 17:19:41,550 • INFO •   [STAGE] Processed 490/492 pages (0.00s for page 490)
+2025-11-16 17:19:41,751 • INFO •   [STAGE] PDF extraction complete: 6341 elements in 52.38s
+2025-11-16 17:19:41,752 • INFO •   [STAGE] Table extraction: 39 successful, 0 failed (extracted as text)
+2025-11-16 17:19:41,752 • INFO •   [STAGE] Document parsing complete in 52.38s
+2025-11-16 17:19:41,752 • INFO •   [STAGE] Extracted 6341 elements from Managing Complications in pregnancy and childbirth, WHO.pdf
+2025-11-16 17:19:41,753 • INFO •   [STAGE] Starting chunking (chunk_size=1200, overlap=120)...
+2025-11-16 17:19:41,760 • INFO •   [STAGE] Collected 341 text blocks (including 39 tables) in 0.01s
+2025-11-16 17:19:41,869 • INFO •   [STAGE] Chunking complete: 745 chunks created in 0.12s (split: 0.11s)
+2025-11-16 17:19:41,869 • INFO •   [STAGE] Starting embedding & upsert: 745 chunks in 24 batches (batch_size=32)...
+2025-11-16 17:19:52,226 • INFO •     [BATCH 1/24] Encoded: 10.21s | Prepared: 0.00s | Upserted: 0.14s | Total: 10.36s | Chunks: 32
+2025-11-16 17:20:00,151 • INFO •     [BATCH 2/24] Encoded: 7.81s | Prepared: 0.00s | Upserted: 0.11s | Total: 7.92s | Chunks: 32
+2025-11-16 17:20:09,078 • INFO •     [BATCH 3/24] Encoded: 8.86s | Prepared: 0.00s | Upserted: 0.06s | Total: 8.93s | Chunks: 32
+2025-11-16 17:20:17,195 • INFO •     [BATCH 4/24] Encoded: 8.05s | Prepared: 0.00s | Upserted: 0.07s | Total: 8.12s | Chunks: 32
+2025-11-16 17:20:28,178 • INFO •     [BATCH 5/24] Encoded: 10.91s | Prepared: 0.00s | Upserted: 0.07s | Total: 10.98s | Chunks: 32
+2025-11-16 17:20:36,932 • INFO •     [BATCH 6/24] Encoded: 8.67s | Prepared: 0.00s | Upserted: 0.08s | Total: 8.75s | Chunks: 32
+2025-11-16 17:20:45,408 • INFO •     [BATCH 7/24] Encoded: 8.41s | Prepared: 0.00s | Upserted: 0.07s | Total: 8.48s | Chunks: 32
+2025-11-16 17:20:53,650 • INFO •     [BATCH 8/24] Encoded: 8.17s | Prepared: 0.00s | Upserted: 0.07s | Total: 8.24s | Chunks: 32
+2025-11-16 17:21:02,735 • INFO •     [BATCH 9/24] Encoded: 9.00s | Prepared: 0.00s | Upserted: 0.09s | Total: 9.08s | Chunks: 32
+2025-11-16 17:21:13,877 • INFO •     [BATCH 10/24] Encoded: 11.05s | Prepared: 0.00s | Upserted: 0.09s | Total: 11.14s | Chunks: 32
+2025-11-16 17:21:23,060 • INFO •     [BATCH 11/24] Encoded: 9.07s | Prepared: 0.00s | Upserted: 0.11s | Total: 9.18s | Chunks: 32
+2025-11-16 17:21:32,619 • INFO •     [BATCH 12/24] Encoded: 9.42s | Prepared: 0.00s | Upserted: 0.13s | Total: 9.56s | Chunks: 32
+2025-11-16 17:21:41,149 • INFO •     [BATCH 13/24] Encoded: 8.42s | Prepared: 0.00s | Upserted: 0.11s | Total: 8.53s | Chunks: 32
+2025-11-16 17:21:50,447 • INFO •     [BATCH 14/24] Encoded: 9.22s | Prepared: 0.00s | Upserted: 0.08s | Total: 9.30s | Chunks: 32
+2025-11-16 17:22:01,184 • INFO •     [BATCH 15/24] Encoded: 10.66s | Prepared: 0.00s | Upserted: 0.07s | Total: 10.74s | Chunks: 32
+2025-11-16 17:22:11,220 • INFO •     [BATCH 16/24] Encoded: 9.96s | Prepared: 0.00s | Upserted: 0.07s | Total: 10.04s | Chunks: 32
+2025-11-16 17:22:19,301 • INFO •     [BATCH 17/24] Encoded: 8.00s | Prepared: 0.00s | Upserted: 0.08s | Total: 8.08s | Chunks: 32
+2025-11-16 17:22:27,464 • INFO •     [BATCH 18/24] Encoded: 8.08s | Prepared: 0.00s | Upserted: 0.09s | Total: 8.16s | Chunks: 32
+2025-11-16 17:22:38,392 • INFO •     [BATCH 19/24] Encoded: 10.84s | Prepared: 0.00s | Upserted: 0.09s | Total: 10.93s | Chunks: 32
+2025-11-16 17:22:47,977 • INFO •     [BATCH 20/24] Encoded: 9.46s | Prepared: 0.00s | Upserted: 0.13s | Total: 9.58s | Chunks: 32
+2025-11-16 17:22:56,971 • INFO •     [BATCH 21/24] Encoded: 8.91s | Prepared: 0.00s | Upserted: 0.09s | Total: 8.99s | Chunks: 32
+2025-11-16 17:23:04,676 • INFO •     [BATCH 22/24] Encoded: 7.61s | Prepared: 0.00s | Upserted: 0.09s | Total: 7.70s | Chunks: 32
+2025-11-16 17:23:14,225 • INFO •     [BATCH 23/24] Encoded: 9.44s | Prepared: 0.00s | Upserted: 0.10s | Total: 9.55s | Chunks: 32
+2025-11-16 17:23:17,127 • INFO •     [BATCH 24/24] Encoded: 2.85s | Prepared: 0.00s | Upserted: 0.05s | Total: 2.90s | Chunks: 9
+2025-11-16 17:23:17,127 • INFO •   [STAGE] [OK] Embedding & upsert complete: 745 chunks in 215.26s (avg 288.94ms/chunk)
+2025-11-16 17:23:17,140 • INFO •   [OK] Generated 745 chunks in 267.77s
+2025-11-16 17:23:17,140 • INFO •   [STAGE] [OK] File processing complete: Managing Complications in pregnancy and childbirth, WHO.pdf in 267.77s total
+2025-11-16 17:23:17,144 • INFO • 
+[PROGRESS] 5/14 files completed | 9 remaining
+
+2025-11-16 17:23:17,144 • INFO • 
+============================================================
+2025-11-16 17:23:17,144 • INFO • PROCESSING FILE 6/14: MgSO4 Dosing and Monitoring Checklist.pdf
+2025-11-16 17:23:17,145 • INFO • ============================================================
+2025-11-16 17:23:17,145 • INFO • [6/14] Processing: MgSO4 Dosing and Monitoring Checklist.pdf
+2025-11-16 17:23:17,145 • INFO •   [STAGE] Parsing PDF: MgSO4 Dosing and Monitoring Checklist.pdf
+2025-11-16 17:23:17,145 • INFO •   [STAGE] Opening PDF file...
+2025-11-16 17:23:17,146 • INFO •   [STAGE] PDF opened in 0.00s (2 pages)
+2025-11-16 17:23:17,624 • INFO •   [STAGE] PDF extraction complete: 67 elements in 0.48s
+2025-11-16 17:23:17,624 • INFO •   [STAGE] Table extraction: 1 successful, 0 failed (extracted as text)
+2025-11-16 17:23:17,624 • INFO •   [STAGE] Document parsing complete in 0.48s
+2025-11-16 17:23:17,625 • INFO •   [STAGE] Extracted 67 elements from MgSO4 Dosing and Monitoring Checklist.pdf
+2025-11-16 17:23:17,625 • INFO •   [STAGE] Starting chunking (chunk_size=1200, overlap=120)...
+2025-11-16 17:23:17,625 • INFO •   [STAGE] Collected 4 text blocks (including 1 tables) in 0.00s
+2025-11-16 17:23:17,626 • INFO •   [STAGE] Chunking complete: 7 chunks created in 0.00s (split: 0.00s)
+2025-11-16 17:23:17,626 • INFO •   [STAGE] Starting embedding & upsert: 7 chunks in 1 batches (batch_size=32)...
+2025-11-16 17:23:19,848 • INFO •     [BATCH 1/1] Encoded: 2.17s | Prepared: 0.00s | Upserted: 0.05s | Total: 2.22s | Chunks: 7
+2025-11-16 17:23:19,849 • INFO •   [STAGE] [OK] Embedding & upsert complete: 7 chunks in 2.22s (avg 317.47ms/chunk)
+2025-11-16 17:23:19,850 • INFO •   [OK] Generated 7 chunks in 2.71s
+2025-11-16 17:23:19,850 • INFO •   [STAGE] [OK] File processing complete: MgSO4 Dosing and Monitoring Checklist.pdf in 2.71s total
+2025-11-16 17:23:19,850 • INFO • 
+[PROGRESS] 6/14 files completed | 8 remaining
+
+2025-11-16 17:23:19,850 • INFO • 
+============================================================
+2025-11-16 17:23:19,851 • INFO • PROCESSING FILE 7/14: Minimum_Care_Package_SLL.docx
+2025-11-16 17:23:19,851 • INFO • ============================================================
+2025-11-16 17:23:19,851 • INFO • [7/14] Processing: Minimum_Care_Package_SLL.docx
+2025-11-16 17:23:19,851 • INFO •   [STAGE] Parsing DOCX: Minimum_Care_Package_SLL.docx
+2025-11-16 17:23:19,851 • INFO •   [STAGE] Opening DOCX file...
+2025-11-16 17:23:19,890 • INFO •   [STAGE] DOCX opened in 0.04s
+2025-11-16 17:23:20,029 • INFO •   [STAGE] Extracted 267 paragraphs/headings in 0.14s
+2025-11-16 17:23:20,036 • INFO •   [STAGE] Extracted 5 tables in 0.01s
+2025-11-16 17:23:20,036 • INFO •   [STAGE] DOCX extraction complete: 272 total elements in 0.19s
+2025-11-16 17:23:20,037 • INFO •   [STAGE] Document parsing complete in 0.19s
+2025-11-16 17:23:20,037 • INFO •   [STAGE] Extracted 272 elements from Minimum_Care_Package_SLL.docx
+2025-11-16 17:23:20,037 • INFO •   [STAGE] Starting chunking (chunk_size=1200, overlap=120)...
+2025-11-16 17:23:20,038 • INFO •   [STAGE] Collected 6 text blocks (including 5 tables) in 0.00s
+2025-11-16 17:23:20,040 • INFO •   [STAGE] Chunking complete: 101 chunks created in 0.00s (split: 0.00s)
+2025-11-16 17:23:20,040 • INFO •   [STAGE] Starting embedding & upsert: 101 chunks in 4 batches (batch_size=32)...
+2025-11-16 17:23:27,361 • INFO •     [BATCH 1/4] Encoded: 7.23s | Prepared: 0.00s | Upserted: 0.09s | Total: 7.32s | Chunks: 32
+2025-11-16 17:23:33,300 • INFO •     [BATCH 2/4] Encoded: 5.86s | Prepared: 0.00s | Upserted: 0.07s | Total: 5.94s | Chunks: 32
+2025-11-16 17:23:40,823 • INFO •     [BATCH 3/4] Encoded: 7.44s | Prepared: 0.00s | Upserted: 0.09s | Total: 7.52s | Chunks: 32
+2025-11-16 17:23:41,797 • INFO •     [BATCH 4/4] Encoded: 0.91s | Prepared: 0.00s | Upserted: 0.06s | Total: 0.97s | Chunks: 5
+2025-11-16 17:23:41,797 • INFO •   [STAGE] [OK] Embedding & upsert complete: 101 chunks in 21.76s (avg 215.41ms/chunk)
+2025-11-16 17:23:41,798 • INFO •   [OK] Generated 101 chunks in 21.95s
+2025-11-16 17:23:41,798 • INFO •   [STAGE] [OK] File processing complete: Minimum_Care_Package_SLL.docx in 21.95s total
+2025-11-16 17:23:41,798 • INFO • 
+[PROGRESS] 7/14 files completed | 7 remaining
+
+2025-11-16 17:23:41,798 • INFO • 
+============================================================
+2025-11-16 17:23:41,799 • INFO • PROCESSING FILE 8/14: NICU manual.pdf
+2025-11-16 17:23:41,799 • INFO • ============================================================
+2025-11-16 17:23:41,799 • INFO • [8/14] Processing: NICU manual.pdf
+2025-11-16 17:23:41,799 • INFO •   [STAGE] Parsing PDF: NICU manual.pdf
+2025-11-16 17:23:41,799 • INFO •   [STAGE] Opening PDF file...
+2025-11-16 17:23:41,837 • INFO •   [STAGE] PDF opened in 0.04s (277 pages)
+2025-11-16 17:23:43,081 • INFO •   [STAGE] Processed 10/277 pages (0.42s for page 10)
+2025-11-16 17:23:44,460 • INFO •   [STAGE] Processed 20/277 pages (0.12s for page 20)
+2025-11-16 17:23:45,260 • INFO •   [STAGE] Processed 30/277 pages (0.08s for page 30)
+2025-11-16 17:23:46,175 • INFO •   [STAGE] Processed 40/277 pages (0.02s for page 40)
+2025-11-16 17:23:47,090 • INFO •   [STAGE] Processed 50/277 pages (0.02s for page 50)
+2025-11-16 17:23:48,259 • INFO •   [STAGE] Processed 60/277 pages (0.09s for page 60)
+2025-11-16 17:23:48,955 • INFO •   [STAGE] Processed 70/277 pages (0.10s for page 70)
+2025-11-16 17:23:49,943 • INFO •   [STAGE] Processed 80/277 pages (0.16s for page 80)
+2025-11-16 17:23:50,659 • INFO •   [STAGE] Processed 90/277 pages (0.09s for page 90)
+2025-11-16 17:23:51,731 • INFO •   [STAGE] Processed 100/277 pages (0.15s for page 100)
+2025-11-16 17:23:53,680 • INFO •   [STAGE] Processed 110/277 pages (0.13s for page 110)
+2025-11-16 17:23:55,060 • INFO •   [STAGE] Processed 120/277 pages (0.22s for page 120)
+2025-11-16 17:23:57,136 • INFO •   [STAGE] Processed 130/277 pages (0.25s for page 130)
+2025-11-16 17:23:58,136 • INFO •   [STAGE] Processed 140/277 pages (0.19s for page 140)
+2025-11-16 17:23:59,159 • INFO •   [STAGE] Processed 150/277 pages (0.08s for page 150)
+2025-11-16 17:24:00,122 • INFO •   [STAGE] Processed 160/277 pages (0.15s for page 160)
+2025-11-16 17:24:02,528 • INFO •   [STAGE] Processed 170/277 pages (0.17s for page 170)
+2025-11-16 17:24:03,435 • INFO •   [STAGE] Processed 180/277 pages (0.06s for page 180)
+2025-11-16 17:24:04,790 • INFO •   [STAGE] Processed 190/277 pages (0.05s for page 190)
+2025-11-16 17:24:06,140 • INFO •   [STAGE] Processed 200/277 pages (0.06s for page 200)
+2025-11-16 17:24:07,194 • INFO •   [STAGE] Processed 210/277 pages (0.03s for page 210)
+2025-11-16 17:24:07,955 • INFO •   [STAGE] Processed 220/277 pages (0.09s for page 220)
+2025-11-16 17:24:09,053 • INFO •   [STAGE] Processed 230/277 pages (0.14s for page 230)
+2025-11-16 17:24:10,280 • INFO •   [STAGE] Processed 240/277 pages (0.16s for page 240)
+2025-11-16 17:24:11,366 • INFO •   [STAGE] Processed 250/277 pages (0.08s for page 250)
+2025-11-16 17:24:12,290 • INFO •   [STAGE] Processed 260/277 pages (0.03s for page 260)
+2025-11-16 17:24:14,927 • INFO •   [STAGE] Processed 270/277 pages (0.57s for page 270)
+2025-11-16 17:24:16,764 • INFO •   [STAGE] PDF extraction complete: 3130 elements in 34.96s
+2025-11-16 17:24:16,764 • INFO •   [STAGE] Table extraction: 101 successful, 0 failed (extracted as text)
+2025-11-16 17:24:16,765 • INFO •   [STAGE] Document parsing complete in 34.97s
+2025-11-16 17:24:16,765 • INFO •   [STAGE] Extracted 3130 elements from NICU manual.pdf
+2025-11-16 17:24:16,765 • INFO •   [STAGE] Starting chunking (chunk_size=1200, overlap=120)...
+2025-11-16 17:24:16,768 • INFO •   [STAGE] Collected 250 text blocks (including 101 tables) in 0.00s
+2025-11-16 17:24:16,834 • INFO •   [STAGE] Chunking complete: 552 chunks created in 0.07s (split: 0.07s)
+2025-11-16 17:24:16,834 • INFO •   [STAGE] Starting embedding & upsert: 552 chunks in 18 batches (batch_size=32)...
+2025-11-16 17:24:26,256 • INFO •     [BATCH 1/18] Encoded: 9.34s | Prepared: 0.00s | Upserted: 0.09s | Total: 9.42s | Chunks: 32
+2025-11-16 17:24:33,930 • INFO •     [BATCH 2/18] Encoded: 7.57s | Prepared: 0.00s | Upserted: 0.10s | Total: 7.67s | Chunks: 32
+2025-11-16 17:24:41,602 • INFO •     [BATCH 3/18] Encoded: 7.57s | Prepared: 0.00s | Upserted: 0.10s | Total: 7.67s | Chunks: 32
+2025-11-16 17:24:48,794 • INFO •     [BATCH 4/18] Encoded: 7.08s | Prepared: 0.00s | Upserted: 0.11s | Total: 7.19s | Chunks: 32
+2025-11-16 17:24:57,263 • INFO •     [BATCH 5/18] Encoded: 8.36s | Prepared: 0.00s | Upserted: 0.11s | Total: 8.47s | Chunks: 32
+2025-11-16 17:25:05,041 • INFO •     [BATCH 6/18] Encoded: 7.63s | Prepared: 0.00s | Upserted: 0.14s | Total: 7.78s | Chunks: 32
+2025-11-16 17:25:14,574 • INFO •     [BATCH 7/18] Encoded: 9.48s | Prepared: 0.00s | Upserted: 0.06s | Total: 9.53s | Chunks: 32
+2025-11-16 17:25:24,039 • INFO •     [BATCH 8/18] Encoded: 9.41s | Prepared: 0.00s | Upserted: 0.06s | Total: 9.46s | Chunks: 32
+2025-11-16 17:25:31,853 • INFO •     [BATCH 9/18] Encoded: 7.75s | Prepared: 0.00s | Upserted: 0.06s | Total: 7.81s | Chunks: 32
+2025-11-16 17:25:41,489 • INFO •     [BATCH 10/18] Encoded: 9.58s | Prepared: 0.00s | Upserted: 0.05s | Total: 9.64s | Chunks: 32
+2025-11-16 17:25:51,070 • INFO •     [BATCH 11/18] Encoded: 9.52s | Prepared: 0.00s | Upserted: 0.06s | Total: 9.58s | Chunks: 32
+2025-11-16 17:25:59,500 • INFO •     [BATCH 12/18] Encoded: 8.35s | Prepared: 0.00s | Upserted: 0.08s | Total: 8.43s | Chunks: 32
+2025-11-16 17:26:09,020 • INFO •     [BATCH 13/18] Encoded: 9.46s | Prepared: 0.00s | Upserted: 0.06s | Total: 9.52s | Chunks: 32
+2025-11-16 17:26:16,023 • INFO •     [BATCH 14/18] Encoded: 6.91s | Prepared: 0.00s | Upserted: 0.09s | Total: 7.00s | Chunks: 32
+2025-11-16 17:26:23,074 • INFO •     [BATCH 15/18] Encoded: 6.98s | Prepared: 0.00s | Upserted: 0.07s | Total: 7.05s | Chunks: 32
+2025-11-16 17:26:30,221 • INFO •     [BATCH 16/18] Encoded: 7.08s | Prepared: 0.00s | Upserted: 0.07s | Total: 7.15s | Chunks: 32
+2025-11-16 17:26:39,645 • INFO •     [BATCH 17/18] Encoded: 9.36s | Prepared: 0.00s | Upserted: 0.07s | Total: 9.42s | Chunks: 32
+2025-11-16 17:26:42,266 • INFO •     [BATCH 18/18] Encoded: 2.58s | Prepared: 0.00s | Upserted: 0.04s | Total: 2.62s | Chunks: 8
+2025-11-16 17:26:42,266 • INFO •   [STAGE] [OK] Embedding & upsert complete: 552 chunks in 145.43s (avg 263.46ms/chunk)
+2025-11-16 17:26:42,288 • INFO •   [OK] Generated 552 chunks in 180.49s
+2025-11-16 17:26:42,289 • INFO •   [STAGE] [OK] File processing complete: NICU manual.pdf in 180.49s total
+2025-11-16 17:26:42,290 • INFO • 
+[PROGRESS] 8/14 files completed | 6 remaining
+
+2025-11-16 17:26:42,290 • INFO • 
+============================================================
+2025-11-16 17:26:42,291 • INFO • PROCESSING FILE 9/14: Pre-Eclampsia and Eclampsia Medication Table.pdf
+2025-11-16 17:26:42,291 • INFO • ============================================================
+2025-11-16 17:26:42,291 • INFO • [9/14] Processing: Pre-Eclampsia and Eclampsia Medication Table.pdf
+2025-11-16 17:26:42,291 • INFO •   [STAGE] Parsing PDF: Pre-Eclampsia and Eclampsia Medication Table.pdf
+2025-11-16 17:26:42,292 • INFO •   [STAGE] Opening PDF file...
+2025-11-16 17:26:42,293 • INFO •   [STAGE] PDF opened in 0.00s (1 pages)
+2025-11-16 17:26:42,670 • INFO •   [STAGE] PDF extraction complete: 24 elements in 0.38s
+2025-11-16 17:26:42,670 • INFO •   [STAGE] Table extraction: 1 successful, 0 failed (extracted as text)
+2025-11-16 17:26:42,671 • INFO •   [STAGE] Document parsing complete in 0.38s
+2025-11-16 17:26:42,671 • INFO •   [STAGE] Extracted 24 elements from Pre-Eclampsia and Eclampsia Medication Table.pdf
+2025-11-16 17:26:42,671 • INFO •   [STAGE] Starting chunking (chunk_size=1200, overlap=120)...
+2025-11-16 17:26:42,671 • INFO •   [STAGE] Collected 4 text blocks (including 1 tables) in 0.00s
+2025-11-16 17:26:42,672 • INFO •   [STAGE] Chunking complete: 4 chunks created in 0.00s (split: 0.00s)
+2025-11-16 17:26:42,672 • INFO •   [STAGE] Starting embedding & upsert: 4 chunks in 1 batches (batch_size=32)...
+2025-11-16 17:26:44,047 • INFO •     [BATCH 1/1] Encoded: 1.34s | Prepared: 0.00s | Upserted: 0.04s | Total: 1.37s | Chunks: 4
+2025-11-16 17:26:44,047 • INFO •   [STAGE] [OK] Embedding & upsert complete: 4 chunks in 1.37s (avg 343.72ms/chunk)
+2025-11-16 17:26:44,048 • INFO •   [OK] Generated 4 chunks in 1.76s
+2025-11-16 17:26:44,048 • INFO •   [STAGE] [OK] File processing complete: Pre-Eclampsia and Eclampsia Medication Table.pdf in 1.76s total
+2025-11-16 17:26:44,048 • INFO • 
+[PROGRESS] 9/14 files completed | 5 remaining
+
+2025-11-16 17:26:44,048 • INFO • 
+============================================================
+2025-11-16 17:26:44,049 • INFO • PROCESSING FILE 10/14: Pre-eclampsia and eclampsia provider guide.pdf
+2025-11-16 17:26:44,049 • INFO • ============================================================
+2025-11-16 17:26:44,049 • INFO • [10/14] Processing: Pre-eclampsia and eclampsia provider guide.pdf
+2025-11-16 17:26:44,049 • INFO •   [STAGE] Parsing PDF: Pre-eclampsia and eclampsia provider guide.pdf
+2025-11-16 17:26:44,049 • INFO •   [STAGE] Opening PDF file...
+2025-11-16 17:26:44,052 • INFO •   [STAGE] PDF opened in 0.00s (68 pages)
+2025-11-16 17:26:46,857 • INFO •   [STAGE] Processed 10/68 pages (0.31s for page 10)
+2025-11-16 17:26:51,651 • INFO •   [STAGE] Processed 20/68 pages (0.60s for page 20)
+2025-11-16 17:26:57,180 • INFO •   [STAGE] Processed 30/68 pages (1.47s for page 30)
+2025-11-16 17:27:02,011 • INFO •   [STAGE] Processed 40/68 pages (0.79s for page 40)
+2025-11-16 17:27:10,214 • INFO •   [STAGE] Processed 50/68 pages (2.22s for page 50)
+2025-11-16 17:27:13,867 • INFO •   [STAGE] Processed 60/68 pages (0.20s for page 60)
+2025-11-16 17:27:17,117 • INFO •   [STAGE] PDF extraction complete: 825 elements in 33.07s
+2025-11-16 17:27:17,118 • INFO •   [STAGE] Table extraction: 16 successful, 0 failed (extracted as text)
+2025-11-16 17:27:17,118 • INFO •   [STAGE] Document parsing complete in 33.07s
+2025-11-16 17:27:17,118 • INFO •   [STAGE] Extracted 825 elements from Pre-eclampsia and eclampsia provider guide.pdf
+2025-11-16 17:27:17,118 • INFO •   [STAGE] Starting chunking (chunk_size=1200, overlap=120)...
+2025-11-16 17:27:17,119 • INFO •   [STAGE] Collected 176 text blocks (including 16 tables) in 0.00s
+2025-11-16 17:27:17,130 • INFO •   [STAGE] Chunking complete: 209 chunks created in 0.01s (split: 0.01s)
+2025-11-16 17:27:17,131 • INFO •   [STAGE] Starting embedding & upsert: 209 chunks in 7 batches (batch_size=32)...
+2025-11-16 17:27:26,585 • INFO •     [BATCH 1/7] Encoded: 9.38s | Prepared: 0.00s | Upserted: 0.07s | Total: 9.45s | Chunks: 32
+2025-11-16 17:27:33,396 • INFO •     [BATCH 2/7] Encoded: 6.74s | Prepared: 0.00s | Upserted: 0.07s | Total: 6.81s | Chunks: 32
+2025-11-16 17:27:40,375 • INFO •     [BATCH 3/7] Encoded: 6.91s | Prepared: 0.00s | Upserted: 0.06s | Total: 6.98s | Chunks: 32
+2025-11-16 17:27:49,099 • INFO •     [BATCH 4/7] Encoded: 8.66s | Prepared: 0.00s | Upserted: 0.06s | Total: 8.72s | Chunks: 32
+2025-11-16 17:27:56,983 • INFO •     [BATCH 5/7] Encoded: 7.80s | Prepared: 0.00s | Upserted: 0.09s | Total: 7.88s | Chunks: 32
+2025-11-16 17:28:05,578 • INFO •     [BATCH 6/7] Encoded: 8.52s | Prepared: 0.00s | Upserted: 0.07s | Total: 8.59s | Chunks: 32
+2025-11-16 17:28:09,361 • INFO •     [BATCH 7/7] Encoded: 3.70s | Prepared: 0.00s | Upserted: 0.08s | Total: 3.78s | Chunks: 17
+2025-11-16 17:28:09,361 • INFO •   [STAGE] [OK] Embedding & upsert complete: 209 chunks in 52.23s (avg 249.91ms/chunk)
+2025-11-16 17:28:09,403 • INFO •   [OK] Generated 209 chunks in 85.35s
+2025-11-16 17:28:09,404 • INFO •   [STAGE] [OK] File processing complete: Pre-eclampsia and eclampsia provider guide.pdf in 85.35s total
+2025-11-16 17:28:09,405 • INFO • 
+[PROGRESS] 10/14 files completed | 4 remaining
+
+2025-11-16 17:28:09,405 • INFO • 
+============================================================
+2025-11-16 17:28:09,405 • INFO • PROCESSING FILE 11/14: Prolonged and Obstructed Labor, Assessment guide.pdf
+2025-11-16 17:28:09,406 • INFO • ============================================================
+2025-11-16 17:28:09,406 • INFO • [11/14] Processing: Prolonged and Obstructed Labor, Assessment guide.pdf
+2025-11-16 17:28:09,406 • INFO •   [STAGE] Parsing PDF: Prolonged and Obstructed Labor, Assessment guide.pdf
+2025-11-16 17:28:09,406 • INFO •   [STAGE] Opening PDF file...
+2025-11-16 17:28:09,410 • INFO •   [STAGE] PDF opened in 0.00s (52 pages)
+2025-11-16 17:28:14,959 • INFO •   [STAGE] Processed 10/52 pages (1.36s for page 10)
+2025-11-16 17:28:21,241 • INFO •   [STAGE] Processed 20/52 pages (0.61s for page 20)
+2025-11-16 17:28:36,077 • INFO •   [STAGE] Processed 30/52 pages (0.06s for page 30)
+2025-11-16 17:28:45,836 • INFO •   [STAGE] Processed 40/52 pages (2.37s for page 40)
+2025-11-16 17:29:36,128 • INFO •   [STAGE] Processed 50/52 pages (0.01s for page 50)
+2025-11-16 17:29:36,922 • INFO •   [STAGE] PDF extraction complete: 1104 elements in 87.52s
+2025-11-16 17:29:36,922 • INFO •   [STAGE] Table extraction: 23 successful, 0 failed (extracted as text)
+2025-11-16 17:29:36,923 • INFO •   [STAGE] Document parsing complete in 87.52s
+2025-11-16 17:29:36,923 • INFO •   [STAGE] Extracted 1104 elements from Prolonged and Obstructed Labor, Assessment guide.pdf
+2025-11-16 17:29:36,923 • INFO •   [STAGE] Starting chunking (chunk_size=1200, overlap=120)...
+2025-11-16 17:29:36,924 • INFO •   [STAGE] Collected 134 text blocks (including 23 tables) in 0.00s
+2025-11-16 17:29:36,933 • INFO •   [STAGE] Chunking complete: 163 chunks created in 0.01s (split: 0.01s)
+2025-11-16 17:29:36,933 • INFO •   [STAGE] Starting embedding & upsert: 163 chunks in 6 batches (batch_size=32)...
+2025-11-16 17:29:47,007 • INFO •     [BATCH 1/6] Encoded: 9.98s | Prepared: 0.00s | Upserted: 0.09s | Total: 10.07s | Chunks: 32
+2025-11-16 17:29:57,023 • INFO •     [BATCH 2/6] Encoded: 9.89s | Prepared: 0.00s | Upserted: 0.13s | Total: 10.02s | Chunks: 32
+2025-11-16 17:30:06,782 • INFO •     [BATCH 3/6] Encoded: 9.68s | Prepared: 0.00s | Upserted: 0.08s | Total: 9.76s | Chunks: 32
+2025-11-16 17:30:13,803 • INFO •     [BATCH 4/6] Encoded: 6.94s | Prepared: 0.00s | Upserted: 0.08s | Total: 7.02s | Chunks: 32
+2025-11-16 17:30:20,526 • INFO •     [BATCH 5/6] Encoded: 6.64s | Prepared: 0.00s | Upserted: 0.08s | Total: 6.72s | Chunks: 32
+2025-11-16 17:30:20,704 • INFO •     [BATCH 6/6] Encoded: 0.13s | Prepared: 0.00s | Upserted: 0.05s | Total: 0.18s | Chunks: 3
+2025-11-16 17:30:20,704 • INFO •   [STAGE] [OK] Embedding & upsert complete: 163 chunks in 43.77s (avg 268.53ms/chunk)
+2025-11-16 17:30:20,765 • INFO •   [OK] Generated 163 chunks in 131.36s
+2025-11-16 17:30:20,765 • INFO •   [STAGE] [OK] File processing complete: Prolonged and Obstructed Labor, Assessment guide.pdf in 131.36s total
+2025-11-16 17:30:20,766 • INFO • 
+[PROGRESS] 11/14 files completed | 3 remaining
+
+2025-11-16 17:30:20,766 • INFO • 
+============================================================
+2025-11-16 17:30:20,767 • INFO • PROCESSING FILE 12/14: Prolonged and Obstructed Labor, Management guide.pdf
+2025-11-16 17:30:20,767 • INFO • ============================================================
+2025-11-16 17:30:20,767 • INFO • [12/14] Processing: Prolonged and Obstructed Labor, Management guide.pdf
+2025-11-16 17:30:20,767 • INFO •   [STAGE] Parsing PDF: Prolonged and Obstructed Labor, Management guide.pdf
+2025-11-16 17:30:20,768 • INFO •   [STAGE] Opening PDF file...
+2025-11-16 17:30:20,773 • INFO •   [STAGE] PDF opened in 0.00s (56 pages)
+2025-11-16 17:30:27,694 • INFO •   [STAGE] Processed 10/56 pages (0.21s for page 10)
+2025-11-16 17:30:36,251 • INFO •   [STAGE] Processed 20/56 pages (0.28s for page 20)
+2025-11-16 17:30:40,868 • INFO •   [STAGE] Processed 30/56 pages (1.17s for page 30)
+2025-11-16 17:30:49,727 • INFO •   [STAGE] Processed 40/56 pages (1.64s for page 40)
+2025-11-16 17:30:52,059 • INFO •   [STAGE] Processed 50/56 pages (0.15s for page 50)
+2025-11-16 17:30:53,452 • INFO •   [STAGE] PDF extraction complete: 1134 elements in 32.68s
+2025-11-16 17:30:53,453 • INFO •   [STAGE] Table extraction: 9 successful, 0 failed (extracted as text)
+2025-11-16 17:30:53,453 • INFO •   [STAGE] Document parsing complete in 32.69s
+2025-11-16 17:30:53,453 • INFO •   [STAGE] Extracted 1134 elements from Prolonged and Obstructed Labor, Management guide.pdf
+2025-11-16 17:30:53,453 • INFO •   [STAGE] Starting chunking (chunk_size=1200, overlap=120)...
+2025-11-16 17:30:53,454 • INFO •   [STAGE] Collected 94 text blocks (including 9 tables) in 0.00s
+2025-11-16 17:30:53,467 • INFO •   [STAGE] Chunking complete: 155 chunks created in 0.01s (split: 0.01s)
+2025-11-16 17:30:53,468 • INFO •   [STAGE] Starting embedding & upsert: 155 chunks in 5 batches (batch_size=32)...
+2025-11-16 17:31:02,978 • INFO •     [BATCH 1/5] Encoded: 9.44s | Prepared: 0.00s | Upserted: 0.07s | Total: 9.51s | Chunks: 32
+2025-11-16 17:31:12,596 • INFO •     [BATCH 2/5] Encoded: 9.54s | Prepared: 0.00s | Upserted: 0.07s | Total: 9.62s | Chunks: 32
+2025-11-16 17:31:19,401 • INFO •     [BATCH 3/5] Encoded: 6.72s | Prepared: 0.00s | Upserted: 0.08s | Total: 6.80s | Chunks: 32
+2025-11-16 17:31:28,960 • INFO •     [BATCH 4/5] Encoded: 9.47s | Prepared: 0.00s | Upserted: 0.08s | Total: 9.56s | Chunks: 32
+2025-11-16 17:31:35,942 • INFO •     [BATCH 5/5] Encoded: 6.89s | Prepared: 0.00s | Upserted: 0.09s | Total: 6.98s | Chunks: 27
+2025-11-16 17:31:35,943 • INFO •   [STAGE] [OK] Embedding & upsert complete: 155 chunks in 42.47s (avg 274.03ms/chunk)
+2025-11-16 17:31:35,991 • INFO •   [OK] Generated 155 chunks in 75.22s
+2025-11-16 17:31:35,991 • INFO •   [STAGE] [OK] File processing complete: Prolonged and Obstructed Labor, Management guide.pdf in 75.22s total
+2025-11-16 17:31:35,992 • INFO • 
+[PROGRESS] 12/14 files completed | 2 remaining
+
+2025-11-16 17:31:35,992 • INFO • 
+============================================================
+2025-11-16 17:31:35,992 • INFO • PROCESSING FILE 13/14: Vacuum-Assisted Birth provider guide.pdf
+2025-11-16 17:31:35,992 • INFO • ============================================================
+2025-11-16 17:31:35,992 • INFO • [13/14] Processing: Vacuum-Assisted Birth provider guide.pdf
+2025-11-16 17:31:35,993 • INFO •   [STAGE] Parsing PDF: Vacuum-Assisted Birth provider guide.pdf
+2025-11-16 17:31:35,993 • INFO •   [STAGE] Opening PDF file...
+2025-11-16 17:31:35,995 • INFO •   [STAGE] PDF opened in 0.00s (68 pages)
+2025-11-16 17:31:43,803 • INFO •   [STAGE] Processed 10/68 pages (1.82s for page 10)
+2025-11-16 17:31:49,830 • INFO •   [STAGE] Processed 20/68 pages (0.80s for page 20)
+2025-11-16 17:32:00,638 • INFO •   [STAGE] Processed 30/68 pages (1.16s for page 30)
+2025-11-16 17:32:08,591 • INFO •   [STAGE] Processed 40/68 pages (0.09s for page 40)
+2025-11-16 17:32:11,274 • INFO •   [STAGE] Processed 50/68 pages (0.19s for page 50)
+2025-11-16 17:32:16,147 • INFO •   [STAGE] Processed 60/68 pages (0.15s for page 60)
+2025-11-16 17:32:18,063 • INFO •   [STAGE] PDF extraction complete: 1256 elements in 42.07s
+2025-11-16 17:32:18,064 • INFO •   [STAGE] Table extraction: 35 successful, 0 failed (extracted as text)
+2025-11-16 17:32:18,064 • INFO •   [STAGE] Document parsing complete in 42.07s
+2025-11-16 17:32:18,064 • INFO •   [STAGE] Extracted 1256 elements from Vacuum-Assisted Birth provider guide.pdf
+2025-11-16 17:32:18,064 • INFO •   [STAGE] Starting chunking (chunk_size=1200, overlap=120)...
+2025-11-16 17:32:18,065 • INFO •   [STAGE] Collected 174 text blocks (including 35 tables) in 0.00s
+2025-11-16 17:32:18,079 • INFO •   [STAGE] Chunking complete: 233 chunks created in 0.02s (split: 0.01s)
+2025-11-16 17:32:18,080 • INFO •   [STAGE] Starting embedding & upsert: 233 chunks in 8 batches (batch_size=32)...
+2025-11-16 17:32:27,653 • INFO •     [BATCH 1/8] Encoded: 9.50s | Prepared: 0.00s | Upserted: 0.07s | Total: 9.57s | Chunks: 32
+2025-11-16 17:32:35,235 • INFO •     [BATCH 2/8] Encoded: 7.49s | Prepared: 0.00s | Upserted: 0.09s | Total: 7.58s | Chunks: 32
+2025-11-16 17:32:41,781 • INFO •     [BATCH 3/8] Encoded: 6.46s | Prepared: 0.00s | Upserted: 0.08s | Total: 6.55s | Chunks: 32
+2025-11-16 17:32:50,694 • INFO •     [BATCH 4/8] Encoded: 8.79s | Prepared: 0.00s | Upserted: 0.13s | Total: 8.91s | Chunks: 32
+2025-11-16 17:32:58,497 • INFO •     [BATCH 5/8] Encoded: 7.74s | Prepared: 0.00s | Upserted: 0.06s | Total: 7.80s | Chunks: 32
+2025-11-16 17:33:08,029 • INFO •     [BATCH 6/8] Encoded: 9.48s | Prepared: 0.00s | Upserted: 0.05s | Total: 9.53s | Chunks: 32
+2025-11-16 17:33:17,455 • INFO •     [BATCH 7/8] Encoded: 9.37s | Prepared: 0.00s | Upserted: 0.05s | Total: 9.43s | Chunks: 32
+2025-11-16 17:33:20,155 • INFO •     [BATCH 8/8] Encoded: 2.66s | Prepared: 0.00s | Upserted: 0.04s | Total: 2.70s | Chunks: 9
+2025-11-16 17:33:20,155 • INFO •   [STAGE] [OK] Embedding & upsert complete: 233 chunks in 62.07s (avg 266.41ms/chunk)
+2025-11-16 17:33:20,206 • INFO •   [OK] Generated 233 chunks in 104.21s
+2025-11-16 17:33:20,206 • INFO •   [STAGE] [OK] File processing complete: Vacuum-Assisted Birth provider guide.pdf in 104.21s total
+2025-11-16 17:33:20,207 • INFO • 
+[PROGRESS] 13/14 files completed | 1 remaining
+
+2025-11-16 17:33:20,207 • INFO • 
+============================================================
+2025-11-16 17:33:20,207 • INFO • PROCESSING FILE 14/14: WHO recommendations on newborn health.pdf
+2025-11-16 17:33:20,207 • INFO • ============================================================
+2025-11-16 17:33:20,208 • INFO • [14/14] Processing: WHO recommendations on newborn health.pdf
+2025-11-16 17:33:20,208 • INFO •   [STAGE] Parsing PDF: WHO recommendations on newborn health.pdf
+2025-11-16 17:33:20,208 • INFO •   [STAGE] Opening PDF file...
+2025-11-16 17:33:20,214 • INFO •   [STAGE] PDF opened in 0.01s (26 pages)
+2025-11-16 17:33:22,552 • INFO •   [STAGE] Processed 10/26 pages (0.87s for page 10)
+2025-11-16 17:33:32,794 • INFO •   [STAGE] Processed 20/26 pages (0.84s for page 20)
+2025-11-16 17:33:36,394 • INFO •   [STAGE] PDF extraction complete: 352 elements in 16.19s
+2025-11-16 17:33:36,394 • INFO •   [STAGE] Table extraction: 7 successful, 0 failed (extracted as text)
+2025-11-16 17:33:36,394 • INFO •   [STAGE] Document parsing complete in 16.19s
+2025-11-16 17:33:36,394 • INFO •   [STAGE] Extracted 352 elements from WHO recommendations on newborn health.pdf
+2025-11-16 17:33:36,395 • INFO •   [STAGE] Starting chunking (chunk_size=1200, overlap=120)...
+2025-11-16 17:33:36,395 • INFO •   [STAGE] Collected 29 text blocks (including 7 tables) in 0.00s
+2025-11-16 17:33:36,401 • INFO •   [STAGE] Chunking complete: 64 chunks created in 0.01s (split: 0.01s)
+2025-11-16 17:33:36,401 • INFO •   [STAGE] Starting embedding & upsert: 64 chunks in 2 batches (batch_size=32)...
+2025-11-16 17:33:43,191 • INFO •     [BATCH 1/2] Encoded: 6.73s | Prepared: 0.00s | Upserted: 0.06s | Total: 6.79s | Chunks: 32
+2025-11-16 17:33:51,397 • INFO •     [BATCH 2/2] Encoded: 8.13s | Prepared: 0.00s | Upserted: 0.08s | Total: 8.21s | Chunks: 32
+2025-11-16 17:33:51,397 • INFO •   [STAGE] [OK] Embedding & upsert complete: 64 chunks in 15.00s (avg 234.31ms/chunk)
+2025-11-16 17:33:51,399 • INFO •   [OK] Generated 64 chunks in 31.19s
+2025-11-16 17:33:51,399 • INFO •   [STAGE] [OK] File processing complete: WHO recommendations on newborn health.pdf in 31.19s total
+2025-11-16 17:33:51,400 • INFO • Manifest saved to FILES\local_vectorstore\file_manifest.json
+2025-11-16 17:33:51,400 • INFO • ============================================================
+2025-11-16 17:33:51,401 • INFO • SETUP COMPLETE
+2025-11-16 17:33:51,401 • INFO •   Files processed: 14/14
+2025-11-16 17:33:51,401 • INFO •   Total chunks: 2968
+2025-11-16 17:33:51,401 • INFO •   Total time: 1269.86s
+2025-11-16 17:33:51,401 • INFO •   Avg time per file: 90.70s
+2025-11-16 17:33:51,401 • INFO • ============================================================
+2025-11-16 17:33:51,404 • INFO • ChromaDB collection now contains 2968 total chunks
