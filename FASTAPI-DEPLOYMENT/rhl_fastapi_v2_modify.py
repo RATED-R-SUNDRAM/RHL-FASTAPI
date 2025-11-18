@@ -591,11 +591,13 @@ CRITICAL RULES:
 - Summarize meaningfully in a perfect flow
 - Do NOT mention references to what's not-there in the context (e.g., "the document doesn't have much info about X" ❌)
 
-STEP 1 - FILTERING:
+STEP 1 - FILTERING (CRITICAL):
 - Evaluate each context chunk individually
-- Use only chunks that contain information relevant to answering the query
-- Ignore chunks that don't address the query topic
-- If a chunk has partial but relevant information, include it
+- Use ONLY chunks that DIRECTLY answer what is asked in the query
+- A chunk directly answers if it contains information that specifically addresses the question
+- If a chunk mentions related topics but doesn't answer the specific question → EXCLUDE it
+- If NO chunks directly answer the query → Return: "I couldn't find sufficient information in the provided documents to answer this question accurately."
+- DO NOT list facts about topics mentioned in context if they don't answer the query
 
 STEP 2 - MULTI-SOURCE CONSOLIDATION (CRITICAL):
 When multiple sources contain information about the same topic:
@@ -760,6 +762,50 @@ Note: The follow-up question extracted the main medical topic "complications of 
 
 ---
 
+Example 6 - When Context Doesn't Answer Query (CRITICAL):
+
+❌ Query: "Is magnesium sulfate recommended for jaundice treatment?"
+Context mentions:
+- "Magnesium sulfate is used for pre-eclampsia prevention..."
+- "Jaundice treatment involves phototherapy..."
+
+Analysis: Context mentions BOTH topics separately but doesn't connect them. No information about magnesium sulfate for jaundice.
+Answer: "I couldn't find sufficient information in the provided documents to answer this question accurately."
+
+❌ Query: "What causes fever?"
+Context: "Headache symptoms include pain, pressure, and sensitivity to light..."
+
+Analysis: Context is about headache, not fever. Wrong topic entirely.
+Answer: "I couldn't find sufficient information in the provided documents to answer this question accurately."
+
+❌ Query: "How to treat dehydration?"
+Context: "Dehydration prevention involves drinking water regularly..."
+
+Analysis: Context is about prevention, not treatment. Doesn't answer what was asked.
+Answer: "I couldn't find sufficient information in the provided documents to answer this question accurately."
+
+❌ Query: "What are the symptoms of jaundice?"
+Context: "Magnesium sulfate dosing involves 4g IV loading dose..."
+
+Analysis: Context is about magnesium sulfate dosing, not jaundice symptoms. Completely unrelated.
+Answer: "I couldn't find sufficient information in the provided documents to answer this question accurately."
+
+✅ Query: "What causes fever?"
+Context: "Fever is caused by infections, inflammatory conditions, and certain medications..."
+
+Analysis: Context directly answers the question about fever causes.
+Answer: [Normal answer generation with facts about fever causes]
+
+✅ Query: "Is magnesium sulfate recommended for pre-eclampsia?"
+Context: "Magnesium sulfate is recommended for pre-eclampsia prevention..."
+
+Analysis: Context directly connects magnesium sulfate to pre-eclampsia.
+Answer: [Normal answer generation]
+
+CRITICAL RULE: If you cannot find information that DIRECTLY answers the query in the context, you MUST respond with: "I couldn't find sufficient information in the provided documents to answer this question accurately." Do NOT list unrelated facts just because the topics are mentioned in the context.
+
+---
+
 WORD LIMIT AND STRUCTURE:
 - STRICTLY 150-200 words total
 - Use 4-5 bullet points if sufficient information is available
@@ -820,7 +866,11 @@ INSTRUCTIONS:
    - Example: "Would you like to know about jaundice treatment?" (not "Would you like more information?")
    - The follow-up question should be the LAST line of your response
 
-IMPORTANT: If chunks in <context> seem partially relevant or borderline, still use them - your role is to judge and extract useful information. Only exclude chunks that are completely unrelated to the query.
+IMPORTANT: 
+- Only use chunks that DIRECTLY answer what is asked in the query
+- If chunks mention related topics but don't answer the specific question → EXCLUDE them
+- If NO chunks directly answer the query → Respond with: "I couldn't find sufficient information in the provided documents to answer this question accurately."
+- DO NOT provide information about topics mentioned in context if they don't answer the query
 
 REMINDER: If <followup_context> is provided, you MUST generate a follow-up question. Do not skip this step.
 
