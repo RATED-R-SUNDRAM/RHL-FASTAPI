@@ -173,12 +173,46 @@ def update_chat_history(user_id: str, current_history_pairs: List[Tuple[str, str
     
     return current_history_pairs, current_summary
 
-def get_chat_context(history_pairs: List[Tuple[str, str, str]], summary: str) -> str:
+def get_chat_context(history_pairs: List[Tuple[str, str, str]], summary: str) -> Tuple[str, str]:
+    """
+    Returns (full_chat_history, last_3_qa_pairs)
+    - full_chat_history: Full formatted history for LLM context
+    - last_3_qa_pairs: Last 3 non-chitchat Q&A pairs formatted for FOLLOW_UP reformulation
+                      Format: "User: <q1> | Bot: <a1>\nUser: <q2> | Bot: <a2>\nUser: <q3> | Bot: <a3>"
+                      This allows LLM to understand conversation context and link follow-ups to the MAIN topic
+                      Returns empty string if no non-chitchat pairs exist
+    """
     # Filter out chitchat messages from verbatim history when constructing context for LLM
     filtered_verbatim_pairs = [(q, a) for q, a, intent in history_pairs if intent != "chitchat"]
     verbatim = "\n".join([f"User: {q} | Bot: {a}" for q, a in filtered_verbatim_pairs])
     combined = (summary + "\n" + verbatim).strip()
-    return combined
+    
+    # Extract last 3 non-chitchat Q&A pairs explicitly for FOLLOW_UP reformulation
+    # This allows the LLM to understand conversation flow and link follow-ups to the MAIN topic
+    last_3_qa_pairs = ""
+    if filtered_verbatim_pairs:
+        # Take last 3 pairs (or fewer if not available)
+        recent_pairs = filtered_verbatim_pairs[-3:]
+        
+        # Format each pair, extracting follow-up offers from "no_context" responses
+        formatted_pairs = []
+        for q, a in recent_pairs:
+            # Extract follow-up offer from "no_context" responses if present
+            if "Would you like to know about" in a or "would you like to know about" in a:
+                followup_match = re.search(r'[Ww]ould you like to know about ([^?]+)', a)
+                if followup_match:
+                    # Format as "Assistant: Would you like to know about X?"
+                    formatted_answer = f"Assistant: Would you like to know about {followup_match.group(1)}?"
+                else:
+                    formatted_answer = f"Assistant: {a}"
+            else:
+                formatted_answer = f"Assistant: {a}"
+            
+            formatted_pairs.append(f"User: {q} | {formatted_answer}")
+        
+        last_3_qa_pairs = "\n".join(formatted_pairs)
+    
+    return combined, last_3_qa_pairs
 
 
 async def _background_update_and_save(user_id: str, user_message: str, bot_reply: str, intent: str, history_pairs: List[Tuple[str, str, str]], current_summary: str):
@@ -283,10 +317,36 @@ REFORMULATION RULES:
 - If CHITCHAT: return original message unchanged (no reformulation needed)
 - If MEDICAL_QUESTION: rewrite as "Give information about [topic] in detail
 " format
-- If FOLLOW_UP: expand into full standalone question using chat history context
+- If FOLLOW_UP: 
+  * The chat_history provided contains the LAST 3 non-chitchat Q&A pairs (format: "User: <q1> | Bot: <a1>\nUser: <q2> | Bot: <a2>\nUser: <q3> | Bot: <a3>")
+  * Analyze the conversation flow to identify the MAIN topic being discussed
+  * The MAIN topic is typically the FIRST/ORIGINAL topic introduced in the conversation (e.g., "jaundice" in a conversation about jaundice, then cure, then prevention)
+  
+  * For DIRECT AFFIRMATIONS (yes, sure, okay, etc.):
+    - If the most recent Bot response contains "Would you like to know about [topic]?" → reformulate to "Provide details on [topic]"
+    - Use the most recent assistant suggestion directly
+  
+  * For ASPECT-BASED FOLLOW-UPS (prevention, cure, treatment, symptoms, causes, types, etc.):
+    - Identify the MAIN topic from the conversation history (the primary medical condition/topic being discussed)
+    - Link the aspect to the MAIN topic, NOT to intermediate responses
+    - Examples:
+      - Conversation: jaundice → cure of jaundice → user says "prevention" → reformulate to "prevention of jaundice" (NOT "prevention of cure of jaundice")
+      - Conversation: diabetes → treatment of diabetes → user says "symptoms" → reformulate to "symptoms of diabetes" (NOT "symptoms of treatment of diabetes")
+    - Common aspects: prevention, cure, treatment, symptoms, causes, types, diagnosis, complications, management
+  
+  * For SHORT QUESTIONS (what, how, when, why):
+    - If related to the MAIN topic, reformulate as "[question] about [MAIN topic]"
+    - Example: Conversation about jaundice, user says "how to treat?" → "How to treat jaundice?"
+  
+  * Always expand short follow-ups into full standalone questions that clearly specify the topic
 - Correct spelling/abbreviations when meaning changes
 - Expand medical abbreviations (IUFD -> Intrauterine fetal death)
 - Keep rewritten_query concise and medically precise
+
+CRITICAL FOR FOLLOW_UP: 
+- When chat_history contains multiple Q&A pairs, identify the MAIN topic from the conversation flow
+- Link aspect-based follow-ups (prevention, cure, treatment, etc.) to the MAIN topic, not intermediate responses
+- Only use the most recent response for direct affirmations ("yes", "sure") to specific offers
 
 EXAMPLES:
 
@@ -349,6 +409,38 @@ question: "yes"
 chat_history: "<answer> would you like to know about newborn jaundice?"
 question: "sure but also provide cure"
 -> {{"classification":"FOLLOW_UP","reason":"affirmation with additional request","rewritten_query":"Provide details on newborn jaundice and its cure","corrections":{{}}}}
+
+chat_history: "Assistant: Would you like to know about newborn feeding patterns?"
+question: "yes"
+-> {{"classification":"FOLLOW_UP","reason":"affirmation to most recent assistant suggestion about newborn feeding patterns","rewritten_query":"Provide details on newborn feeding patterns","corrections":{{}}}}
+
+NOTE: Even if the assistant's previous response was a "no context" message that included a follow-up offer like "Would you like to know about X?", the chat_history will contain "Assistant: Would you like to know about X?" and you should use THIS for FOLLOW_UP reformulation.
+
+EXAMPLES OF CONTEXT-AWARE REFORMULATION:
+
+chat_history: 
+User: jaundice | Assistant: [provides information about jaundice]
+User: cure | Assistant: [provides information about cure of jaundice]
+question: "prevention"
+-> {{"classification":"FOLLOW_UP","reason":"follow-up asking about prevention, linking to main topic jaundice","rewritten_query":"Give information about prevention of jaundice","corrections":{{}}}}
+
+chat_history: 
+User: diabetes | Assistant: [provides information about diabetes]
+User: treatment | Assistant: [provides information about treatment of diabetes]
+question: "symptoms"
+-> {{"classification":"FOLLOW_UP","reason":"follow-up asking about symptoms, linking to main topic diabetes","rewritten_query":"Give information about symptoms of diabetes","corrections":{{}}}}
+
+chat_history: 
+User: jaundice | Assistant: [provides information about jaundice]
+User: cure | Assistant: Would you like to know about complications of jaundice?
+question: "yes"
+-> {{"classification":"FOLLOW_UP","reason":"direct affirmation to most recent offer","rewritten_query":"Provide details on complications of jaundice","corrections":{{}}}}
+
+chat_history: 
+User: jaundice | Assistant: [provides information about jaundice]
+User: cure | Assistant: [no context response] Would you like to know about newborn feeding patterns?
+question: "yes"
+-> {{"classification":"FOLLOW_UP","reason":"direct affirmation to most recent offer about newborn feeding","rewritten_query":"Provide details on newborn feeding patterns","corrections":{{}}}}
 
 Now analyze and respond:
 chat_history:
@@ -1629,10 +1721,17 @@ NOW REWRITE or return as it is in case of chitchat :
         print(f"[reformulate] General error in reformulate_query: {e}")
     return user_message, {} # Default to empty dict for correction in all failure cases
 
-def classify_and_reformulate(chat_history: str, user_message: str) -> Tuple[str, str, str, Dict[str, str], str]:
+def classify_and_reformulate(chat_history: str, user_message: str, last_3_qa_pairs: str = "") -> Tuple[str, str, str, Dict[str, str], str]:
     """
     Combined classification and reformulation using Gemini in a single LLM call.
     Returns: (classification, reason, rewritten_query, corrections, sample_answer)
+    
+    Args:
+        chat_history: Full chat history context
+        user_message: Current user message
+        last_3_qa_pairs: Last 3 non-chitchat Q&A pairs formatted for FOLLOW_UP reformulation
+                        Format: "User: <q1> | Bot: <a1>\nUser: <q2> | Bot: <a2>\nUser: <q3> | Bot: <a3>"
+                        Allows LLM to understand conversation context and link follow-ups to MAIN topic
     """
     global gemini_llm
     
@@ -1643,7 +1742,14 @@ def classify_and_reformulate(chat_history: str, user_message: str) -> Tuple[str,
     # Start timing for this block
     block_start = time.perf_counter()
     
-    prompt = combined_classify_reformulate_prompt.format(chat_history=chat_history, question=user_message)
+    # Use last_3_qa_pairs if available, otherwise fall back to chat_history
+    # This allows LLM to understand conversation flow and link follow-ups to the MAIN topic
+    chat_history_for_prompt = last_3_qa_pairs if last_3_qa_pairs else chat_history
+    if last_3_qa_pairs:
+        print(f"[CLASSIFY_REFORM] Using last 3 Q&A pairs for reformulation context")
+        print(f"[CLASSIFY_REFORM] Context preview: {last_3_qa_pairs[:200]}...")
+    
+    prompt = combined_classify_reformulate_prompt.format(chat_history=chat_history_for_prompt, question=user_message)
     print(f"[CLASSIFY_REFORM] Input: {user_message[:100]}...")
     print(f"[CLASSIFY_REFORM] Chat history length: {len(chat_history)}")
     print("[CLASSIFY_REFORM] Sending prompt to Gemini...")
@@ -1882,10 +1988,10 @@ Response (YES/NO only):"""
             print(f"[VIDEO_SYSTEM] LLM verification failed: {e}")
             return False
 
-# -------------------- CACHE SYSTEM (BERT + LLM APPROACH) --------------------
+# -------------------- CACHE SYSTEM (RERANKER + LLM APPROACH) --------------------
 class CacheSystem:
     def __init__(self, cache_file_path: str = "./FILES/cache_questions.xlsx"):
-        """Initialize the cache system using BERT similarity + LLM verification"""
+        """Initialize the cache system using reranker (same logic as bert_filter_candidates) + LLM verification"""
         self.cache_file_path = cache_file_path
         self.question_list = []  # List of cached questions
         self.answer_list = []    # List of corresponding answers
@@ -1893,13 +1999,7 @@ class CacheSystem:
         # Load cache data
         self._load_cache_data()
         
-        # Initialize BERT model for similarity (reuse video system's model)
-        if self.question_list:
-            print("[CACHE_SYSTEM] Loading BERT model for cache similarity...")
-            self.similarity_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-            print("[CACHE_SYSTEM] BERT model loaded successfully")
-        else:
-            self.similarity_model = None
+        # Note: We use global reranker (same as bert_filter_candidates) instead of separate BERT model
     
     def _load_cache_data(self):
         """Load cache data from Excel file"""
@@ -1926,44 +2026,259 @@ class CacheSystem:
             self.question_list = []
             self.answer_list = []
     
-    def check_cache(self, reformulated_query: str) -> Optional[str]:
-        """Check if reformulated query matches any cached question using BERT + LLM verification"""
-        if not self.question_list or not self.similarity_model:
-            print("[CACHE_SYSTEM] No cache data or model available")
+    def check_cache(self, sample_answer: str, reformulated_query: str) -> Optional[str]:
+        """
+        Check cache using BOTH approaches and use the best match:
+        1. Compare reformulated_query with cached questions (query-to-question matching)
+        2. Compare sample_answer with cached answers (answer-to-answer matching, same logic as bert_filter_candidates)
+        
+        Uses reranker for both comparisons. Picks the best match from either approach.
+        If similarity > 0.6, uses LLM to verify and reframe the cached answer.
+        
+        Args:
+            sample_answer: Sample answer text from reformulation LLM (for better semantic matching)
+            reformulated_query: Reformulated query (for query-to-question matching and LLM verification)
+        
+        Returns:
+            Reframed cached answer if match found, None otherwise
+        """
+        if not self.answer_list or not self.question_list:
+            print("[CACHE_SYSTEM] No cache data available")
+            return None
+        
+        global reranker
+        if not reranker:
+            print("[CACHE_SYSTEM] Reranker not available")
             return None
         
         print("="*60)
         print("CACHE SYSTEM BLOCK")
         print("="*60)
-        print(f"[CACHE_SYSTEM] Checking cache for: {reformulated_query[:100]}...")
+        print(f"[CACHE_SYSTEM] Checking cache using BOTH approaches:")
+        print(f"[CACHE_SYSTEM]   1. reformulated_query vs cached_questions (query-to-question)")
+        print(f"[CACHE_SYSTEM]   2. sample_answer vs cached_answers (answer-to-answer)")
+        print(f"[CACHE_SYSTEM] reformulated_query preview: {reformulated_query[:100]}...")
+        print(f"[CACHE_SYSTEM] sample_answer preview: {sample_answer[:200] if sample_answer else '(empty)'}...")
         
-        # Step 1: BERT Semantic Similarity
-        print("[CACHE_SYSTEM] Step 1: Computing BERT semantic similarities...")
         cache_start = time.perf_counter()
         
-        # Encode reformulated query and all cached questions
-        query_embedding = self.similarity_model.encode([reformulated_query])
-        question_embeddings = self.similarity_model.encode(self.question_list)
-        
-        # Compute cosine similarities
-        similarities = cosine_similarity(query_embedding, question_embeddings)[0]
-        
-        # Find best match
-        best_idx = np.argmax(similarities)
-        best_similarity = similarities[best_idx]
-        
-        cache_end = time.perf_counter()
-        print(f"[CACHE_SYSTEM] BERT similarity computation took {cache_end - cache_start:.3f} seconds")
-        print(f"[CACHE_SYSTEM] Best similarity score: {best_similarity:.3f}")
-        print(f"[CACHE_SYSTEM] Best cached question: {self.question_list[best_idx][:100]}...")
-        
-        # Step 2: Threshold gating without LLM reconfirmation
-        if best_similarity >= 0.60:
-            print("[CACHE_SYSTEM] Similarity >= 0.60, returning cached answer directly")
-            print("="*60)
-            return self.answer_list[best_idx]
-        else:
-            print(f"[CACHE_SYSTEM] Similarity score {best_similarity:.3f} below threshold 0.60 - cache miss")
+        try:
+            best_match_1_idx = None
+            best_match_1_score = 0.0
+            approach_1_attempted = False
+            best_match_2_idx = None
+            best_match_2_score = 0.0
+            approach_2_attempted = False
+            
+            # APPROACH 1: Compare reformulated_query with cached questions
+            print("\n[CACHE_SYSTEM] APPROACH 1: reformulated_query vs cached_questions")
+            if reformulated_query and self.question_list:
+                approach_1_attempted = True
+                question_pairs = []
+                for i, cached_question in enumerate(self.question_list):
+                    if cached_question and len(cached_question.strip()) > 0:
+                        question_pairs.append((reformulated_query, cached_question))
+                
+                if question_pairs:
+                    print(f"[CACHE_SYSTEM] Created {len(question_pairs)} valid question pairs for reranking")
+                    
+                    if hasattr(reranker, "rerank") and FLASHRANK_AVAILABLE:
+                        # FlashRank path - batch rerank (same as Approach 2)
+                        print("[CACHE_SYSTEM] Using FlashRank.rerank path for question matching")
+                        
+                        passages = []
+                        for i, cached_question in enumerate(self.question_list):
+                            if cached_question and len(cached_question.strip()) > 0:
+                                passages.append({"id": f"question_{i}", "text": cached_question})
+                        
+                        if passages:
+                            request = RerankRequest(query=reformulated_query, passages=passages)
+                            ranked = reranker.rerank(request)
+                            
+                            if ranked:
+                                # FlashRank returns: {"id": "...", "score": float} or {"id": "...", "relevance_score": float}
+                                score_field = None
+                                if len(ranked) > 0:
+                                    first_result = ranked[0]
+                                    if isinstance(first_result, dict):
+                                        if "score" in first_result:
+                                            score_field = "score"
+                                        elif "relevance_score" in first_result:
+                                            score_field = "relevance_score"
+                                
+                                if score_field:
+                                    # Create score list aligned with question_list order
+                                    score_map = {}
+                                    for r in ranked:
+                                        r_id = r.get("id")
+                                        r_score = r.get(score_field, 0.0)
+                                        if r_id:
+                                            score_map[r_id] = float(r_score)
+                                    
+                                    scores_q = []
+                                    for i in range(len(self.question_list)):
+                                        question_id = f"question_{i}"
+                                        score_val = score_map.get(question_id, 0.0)
+                                        scores_q.append(score_val)
+                                    
+                                    if scores_q:
+                                        best_match_1_idx = np.argmax(scores_q)
+                                        best_match_1_score = float(scores_q[best_match_1_idx])
+                                        print(f"[CACHE_SYSTEM] Best question match (FlashRank): idx={best_match_1_idx}, score={best_match_1_score:.3f}")
+                    
+                    elif hasattr(reranker, "predict"):
+                        # CrossEncoder path - batch predict
+                        print("[CACHE_SYSTEM] Using CrossEncoder.predict path for question matching")
+                        scores_q = reranker.predict(question_pairs)
+                        
+                        # Handle numpy array or list
+                        if hasattr(scores_q, 'tolist'):
+                            scores_q = scores_q.tolist()
+                        if not isinstance(scores_q, list):
+                            scores_q = list(scores_q) if hasattr(scores_q, '__iter__') else [scores_q]
+                        
+                        if scores_q:
+                            best_match_1_idx = np.argmax(scores_q)
+                            best_match_1_score = float(scores_q[best_match_1_idx])
+                            print(f"[CACHE_SYSTEM] Best question match (CrossEncoder): idx={best_match_1_idx}, score={best_match_1_score:.3f}")
+            
+            # APPROACH 2: Compare sample_answer with cached answers (same logic as bert_filter_candidates)
+            print("\n[CACHE_SYSTEM] APPROACH 2: sample_answer vs cached_answers")
+            if sample_answer and self.answer_list:
+                approach_2_attempted = True
+                # Use sample_answer for comparison
+                comparison_text = sample_answer
+                
+                answer_pairs = []
+                for i, cached_answer in enumerate(self.answer_list):
+                    if cached_answer and len(cached_answer.strip()) > 0:
+                        answer_pairs.append((comparison_text, cached_answer))
+                
+                if answer_pairs:
+                    print(f"[CACHE_SYSTEM] Created {len(answer_pairs)} valid answer pairs for reranking")
+                    
+                    if hasattr(reranker, "rerank") and FLASHRANK_AVAILABLE:
+                        # FlashRank path - batch rerank (same as bert_filter_candidates)
+                        print("[CACHE_SYSTEM] Using FlashRank.rerank path for answer matching")
+                        
+                        # For FlashRank, use reformulated_query if sample_answer is too long
+                        flashrank_query = reformulated_query if len(comparison_text) > 200 else comparison_text
+                        print(f"[CACHE_SYSTEM] Using {'reformulated_query' if len(comparison_text) > 200 else 'sample_answer'} for FlashRank (len={len(flashrank_query)})")
+                        
+                        passages = []
+                        for i, cached_answer in enumerate(self.answer_list):
+                            if cached_answer and len(cached_answer.strip()) > 0:
+                                passages.append({"id": f"cache_{i}", "text": cached_answer})
+                        
+                        if passages:
+                            request = RerankRequest(query=flashrank_query, passages=passages)
+                            ranked = reranker.rerank(request)
+                            
+                            if ranked:
+                                # FlashRank returns: {"id": "...", "score": float} or {"id": "...", "relevance_score": float}
+                                score_field = None
+                                if len(ranked) > 0:
+                                    first_result = ranked[0]
+                                    if isinstance(first_result, dict):
+                                        if "score" in first_result:
+                                            score_field = "score"
+                                        elif "relevance_score" in first_result:
+                                            score_field = "relevance_score"
+                                
+                                if score_field:
+                                    # Create score list aligned with answer_list order
+                                    score_map = {}
+                                    for r in ranked:
+                                        r_id = r.get("id")
+                                        r_score = r.get(score_field, 0.0)
+                                        if r_id:
+                                            score_map[r_id] = float(r_score)
+                                    
+                                    scores_a = []
+                                    for i in range(len(self.answer_list)):
+                                        cache_id = f"cache_{i}"
+                                        score_val = score_map.get(cache_id, 0.0)
+                                        scores_a.append(score_val)
+                                    
+                                    if scores_a:
+                                        best_match_2_idx = np.argmax(scores_a)
+                                        best_match_2_score = float(scores_a[best_match_2_idx])
+                                        print(f"[CACHE_SYSTEM] Best answer match (FlashRank): idx={best_match_2_idx}, score={best_match_2_score:.3f}")
+                    
+                    elif hasattr(reranker, "predict"):
+                        # CrossEncoder path - batch predict (same as bert_filter_candidates)
+                        print("[CACHE_SYSTEM] Using CrossEncoder.predict path for answer matching")
+                        scores_a = reranker.predict(answer_pairs)
+                        
+                        # Handle numpy array or list
+                        if hasattr(scores_a, 'tolist'):
+                            scores_a = scores_a.tolist()
+                        if not isinstance(scores_a, list):
+                            scores_a = list(scores_a) if hasattr(scores_a, '__iter__') else [scores_a]
+                        
+                        if scores_a:
+                            best_match_2_idx = np.argmax(scores_a)
+                            best_match_2_score = float(scores_a[best_match_2_idx])
+                            print(f"[CACHE_SYSTEM] Best answer match (CrossEncoder): idx={best_match_2_idx}, score={best_match_2_score:.3f}")
+            
+            # Check if BOTH approaches meet threshold (both must be >= 0.60)
+            cache_end = time.perf_counter()
+            print(f"\n[CACHE_SYSTEM] Reranker computation took {cache_end - cache_start:.3f} seconds")
+            approach_1_status = f"best_score={best_match_1_score:.3f}, idx={best_match_1_idx}" if approach_1_attempted else "NOT ATTEMPTED (empty reformulated_query or no cached questions)"
+            approach_2_status = f"best_score={best_match_2_score:.3f}, idx={best_match_2_idx}" if approach_2_attempted else "NOT ATTEMPTED (empty sample_answer or no cached answers)"
+            print(f"[CACHE_SYSTEM] Approach 1 (query-to-question): {approach_1_status}")
+            print(f"[CACHE_SYSTEM] Approach 2 (answer-to-answer): {approach_2_status}")
+            
+            # Both checks must be >= 0.60 to use cache
+            # If either approach wasn't attempted or scored below 0.60, proceed to retrieval
+            if approach_1_attempted and approach_2_attempted and best_match_1_score >= 0.60 and best_match_2_score >= 0.60:
+                # Both checks passed - use cache answer
+                # Use the answer-to-answer match (approach 2) as it's more reliable for semantic matching
+                best_idx = best_match_2_idx
+                best_similarity = best_match_2_score
+                
+                print(f"\n[CACHE_SYSTEM] BOTH checks passed threshold 0.60:")
+                print(f"[CACHE_SYSTEM]   Approach 1 (query-to-question): {best_match_1_score:.3f} >= 0.60 ✓")
+                print(f"[CACHE_SYSTEM]   Approach 2 (answer-to-answer): {best_match_2_score:.3f} >= 0.60 ✓")
+                print(f"[CACHE_SYSTEM] Using cached answer at idx={best_idx}")
+                cached_q_preview = self.question_list[best_idx][:100] if best_idx < len(self.question_list) else "(none)"
+                print(f"[CACHE_SYSTEM] Cached question: {cached_q_preview}...")
+                print(f"[CACHE_SYSTEM] Cached answer preview: {self.answer_list[best_idx][:100]}...")
+                
+                # Step 2: Use LLM to verify and reframe the cached answer
+                print(f"[CACHE_SYSTEM] Using LLM to verify and reframe cached answer...")
+                cached_question = self.question_list[best_idx] if best_idx < len(self.question_list) else ""
+                cached_answer = self.answer_list[best_idx]
+                
+                # Use LLM to verify and reframe the cached answer
+                reframed_answer = self._verify_and_reframe_cache(reformulated_query, cached_question, cached_answer)
+                
+                if reframed_answer:
+                    print("[CACHE_SYSTEM] LLM verified and reframed cached answer successfully")
+                    print("="*60)
+                    return reframed_answer
+                else:
+                    print("[CACHE_SYSTEM] LLM determined cached answer cannot answer the query")
+                    print("="*60)
+                    return None
+            else:
+                # At least one check failed or wasn't attempted - proceed to retrieval
+                print(f"\n[CACHE_SYSTEM] At least one check below threshold 0.60 or not attempted - proceeding to retrieval")
+                if approach_1_attempted:
+                    print(f"[CACHE_SYSTEM] Approach 1 (query-to-question): {best_match_1_score:.3f} {'>= 0.60 ✓' if best_match_1_score >= 0.60 else '< 0.60 ✗'}")
+                else:
+                    print(f"[CACHE_SYSTEM] Approach 1 (query-to-question): NOT ATTEMPTED ✗")
+                if approach_2_attempted:
+                    print(f"[CACHE_SYSTEM] Approach 2 (answer-to-answer): {best_match_2_score:.3f} {'>= 0.60 ✓' if best_match_2_score >= 0.60 else '< 0.60 ✗'}")
+                else:
+                    print(f"[CACHE_SYSTEM] Approach 2 (answer-to-answer): NOT ATTEMPTED ✗")
+                print("="*60)
+                return None
+                
+        except Exception as e:
+            print(f"[CACHE_SYSTEM] Error during cache check: {e}")
+            import traceback
+            traceback.print_exc()
             print("="*60)
             return None
     
@@ -2056,19 +2371,20 @@ async def medical_pipeline_api(user_id: str, user_message: str, background_tasks
     print(f"[pipeline] History pairs={len(history_pairs)} summary_len={len(current_summary)}")
     
     # We need to reconstruct the chat_history for the LLM prompts
-    chat_history_context_for_llm = get_chat_context(history_pairs, current_summary)
+    chat_history_context_for_llm, last_3_qa_pairs = get_chat_context(history_pairs, current_summary)
     t2 = time.perf_counter()
     timer.mark("get_chat_context")
     print(f"chat context build took {t2 - t1:.2f} secs")
     print(f"[pipeline] chat_context_len={len(chat_history_context_for_llm)}")
-
+    print(f"[pipeline] last_3_qa_pairs={last_3_qa_pairs[:200] if last_3_qa_pairs else '(none)'}")
+    
     # Combined classification + reformulation using Gemini (OPTIMIZED: Single LLM call instead of two)
     print("\n" + "="*80)
     print("STEP 1+2: CLASSIFICATION + REFORMULATION (GEMINI OPTIMIZED)")
     print("="*80)
     print(f"[PIPELINE] Starting classify_and_reformulate for: {user_message[:50]}...")
     
-    label, reason, rewritten, correction, sample_answer = classify_and_reformulate(chat_history_context_for_llm, user_message)
+    label, reason, rewritten, correction, sample_answer = classify_and_reformulate(chat_history_context_for_llm, user_message, last_3_qa_pairs)
     t3 = time.perf_counter()
     
     print(f"[PIPELINE] classify_and_reformulate took {t3 - t2:.2f} secs")
@@ -2095,11 +2411,12 @@ async def medical_pipeline_api(user_id: str, user_message: str, background_tasks
     # Skip the old reformulation step since it's now combined above
 
     # ---- CACHE CHECK (NEW: BERT + LLM APPROACH) ----
-    print("[pipeline] Step 3: Cache check using BERT + LLM verification...")
+    print("[pipeline] Step 3: Cache check using reranker (same logic as bert_filter_candidates)...")
     cached_answer = None
     if cache_system:
         cache_start = time.perf_counter()
-        cached_answer = cache_system.check_cache(rewritten)
+        # Use sample_answer for comparison (same approach as bert_filter_candidates)
+        cached_answer = cache_system.check_cache(sample_answer, rewritten)
         cache_end = time.perf_counter()
         print(f"[pipeline] Cache check took {cache_end - cache_start:.3f} seconds")
     
