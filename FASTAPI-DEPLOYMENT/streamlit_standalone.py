@@ -196,18 +196,26 @@ if prompt := st.chat_input("Ask a medical question..."):
             request_start = time.time()
             timing_placeholder.info("⏳ Processing request...")
             
-            # Run async pipeline
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+            # Run async pipeline - handle event loop properly for Streamlit
+            try:
+                # Try to get existing event loop
+                loop = asyncio.get_event_loop()
+                if loop.is_closed():
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+            except RuntimeError:
+                # No event loop exists, create new one
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
             
             try:
                 if stream_mode == "Streaming":
                     # For streaming, we'll use the standard pipeline but display progressively
                     # Note: True streaming requires the streaming endpoint, but for standalone
                     # we'll simulate it with progressive display
-                    result = await process_message_streaming(user_id, prompt)
+                    result = loop.run_until_complete(process_message_streaming(user_id, prompt))
                 else:
-                    result = await process_message_standard(user_id, prompt)
+                    result = loop.run_until_complete(process_message_standard(user_id, prompt))
                 
                 total_time = time.time() - request_start
                 full_response = result.get('answer', '')
