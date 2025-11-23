@@ -17,7 +17,16 @@ except Exception:
     Ranker = None
     RerankRequest = None
     FLASHRANK_AVAILABLE = False
-from pinecone import Pinecone, ServerlessSpec
+# ChromaDB for local vector store
+try:
+    import chromadb
+    from chromadb.config import Settings
+    CHROMADB_AVAILABLE = True
+except ImportError:
+    chromadb = None
+    Settings = None
+    CHROMADB_AVAILABLE = False
+    print("WARNING: chromadb not available. Install with: pip install chromadb")
 from langchain_core.prompts import PromptTemplate
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
@@ -39,15 +48,16 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
     raise RuntimeError("GOOGLE_API_KEY missing in environment")
 
-if not OPENAI_API_KEY or not PINECONE_KEY:
-    raise RuntimeError("OPENAI_API_KEY or PINECONE_API_KEY_NEW missing in environment")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY missing in environment")
+# PINECONE_KEY no longer required - using local ChromaDB
 
 app = FastAPI()
 
-# Global variables for models and Pinecone index
+# Global variables for models and ChromaDB collection
 embedding_model: SentenceTransformer = None
 reranker: CrossEncoder = None
-pinecone_index: Pinecone.Index = None
+chromadb_collection = None  # ChromaDB collection (replaces pinecone_index)
 llm: ChatOpenAI = None
 # chitchat_llm removed - now using Gemini for chitchat
 summarizer_llm: ChatOpenAI = None
@@ -907,74 +917,152 @@ def hybrid_retrieve(query: str, top_k_vec: int = 10, u_cap: int = 7) -> List[Dic
     timer.mark("embedding.encode")
     print(f"[HYBRID] embedding.encode took {timer.last - timer.start:.3f}s")
     
-    # 2) PINECONE VECTOR SEARCH
-    print("[HYBRID] Step 2: Querying Pinecone vector database...")
-    vec_resp = pinecone_index.query(
-        vector=q_emb,
-        top_k=top_k_vec,
-        include_metadata=True,
-        include_values=False
-    )
-    timer.mark("pinecone.query")
-    print(f"[HYBRID] pinecone.query took {timer.last - timer.start:.3f}s")
-    print(f"[HYBRID] Retrieved {len(vec_resp.matches)} matches from Pinecone")
+    # 2) CHROMADB VECTOR SEARCH
+    print("[HYBRID] Step 2: Querying ChromaDB vector database...")
+    if chromadb_collection is None:
+        raise RuntimeError("ChromaDB collection not initialized. Run setup_local_vectorstore.py first.")
+    
+    # Check collection has data
+    collection_count = chromadb_collection.count()
+    if collection_count == 0:
+        print(f"[HYBRID] WARNING: ChromaDB collection is empty ({collection_count} chunks)")
+        print("[HYBRID] Returning empty results - run setup_local_vectorstore.py to populate the collection")
+        timer.mark("chromadb.query")
+        print(f"[HYBRID] chromadb.query took {timer.last - timer.start:.3f}s")
+        matches = []
+        print(f"[HYBRID] Retrieved {len(matches)} matches from ChromaDB")
+    else:
+        print(f"[HYBRID] Querying ChromaDB collection with {collection_count} chunks...")
+        try:
+            # ChromaDB query with error handling
+            results = chromadb_collection.query(
+                query_embeddings=[q_emb],
+                n_results=min(top_k_vec, collection_count),  # Don't request more than available
+                include=["metadatas", "documents", "distances"]
+            )
+            timer.mark("chromadb.query")
+            print(f"[HYBRID] chromadb.query took {timer.last - timer.start:.3f}s")
+            
+            # Process results (ChromaDB returns lists of lists)
+            matches = []
+            if results and "ids" in results and results["ids"] and len(results["ids"]) > 0:
+                num_results = len(results["ids"][0])
+                for i in range(num_results):
+                    try:
+                        match_id = results["ids"][0][i]
+                        metadata = results["metadatas"][0][i] if (results.get("metadatas") and len(results["metadatas"]) > 0) else {}
+                        document = results["documents"][0][i] if (results.get("documents") and len(results["documents"]) > 0) else ""
+                        distance = results["distances"][0][i] if (results.get("distances") and len(results["distances"]) > 0) else 1.0
+                        
+                        # Convert distance to similarity score (ChromaDB uses distance, lower is better)
+                        # For cosine similarity: distance = 1 - cosine_similarity
+                        # So: similarity = 1 - distance (for cosine space)
+                        # Cosine distance range: 0 (identical) to 2 (opposite)
+                        # Convert to similarity: similarity = 1 - (distance / 2)
+                        if distance is not None:
+                            # For cosine, ChromaDB returns 1 - cosine_similarity as distance
+                            # So similarity = 1 - distance
+                            similarity = max(0.0, 1.0 - float(distance)) if distance <= 2.0 else 0.0
+                        else:
+                            similarity = 0.0
+                        
+                        matches.append({
+                            "id": match_id,
+                            "metadata": metadata if isinstance(metadata, dict) else {},
+                            "document": document if document else "",
+                            "score": similarity
+                        })
+                    except Exception as e:
+                        print(f"[HYBRID] WARNING: Error processing match {i}: {e}")
+                        continue
+            else:
+                print(f"[HYBRID] WARNING: No results returned from ChromaDB query")
+                matches = []
+            
+            print(f"[HYBRID] Retrieved {len(matches)} matches from ChromaDB")
+        except Exception as e:
+            print(f"[HYBRID] ERROR: ChromaDB query failed: {e}")
+            timer.mark("chromadb.query")
+            print(f"[HYBRID] chromadb.query took {timer.last - timer.start:.3f}s (failed)")
+            raise RuntimeError(f"ChromaDB query failed: {e}") from e
 
     # 3) PROCESS MATCHES
     print("[HYBRID] Step 3: Processing matches and deduplicating...")
-    vec_matches = [{"id": m.id, "text": m.metadata.get("text_full", m.metadata.get("text_snippet", "")), "meta": m.metadata} for m in vec_resp.matches]
+    vec_matches = []
+    for m in matches:
+        try:
+            # Get text from metadata first, then fallback to document
+            text = m["metadata"].get("text_full") or m["metadata"].get("text_snippet") or m.get("document", "")
+            if not text:
+                print(f"[HYBRID] WARNING: Match {m['id']} has no text content, skipping")
+                continue
+            
+            vec_matches.append({
+                "id": m["id"],
+                "text": text,
+                "meta": m["metadata"]
+            })
+        except Exception as e:
+            print(f"[HYBRID] WARNING: Error processing match {m.get('id', 'unknown')}: {e}")
+            continue
+    
     timer.mark("process_matches")
     print(f"[HYBRID] process_matches took {timer.last - timer.start:.3f}s")
 
     # 4) COMBINE & CAP
-    candidates = {m["id"]: m for m in (vec_matches)}  # deduplicate
-    candidates = list(candidates.values())[:u_cap]
+    if not vec_matches:
+        print(f"[HYBRID] WARNING: No valid matches after processing")
+        candidates = []
+    else:
+        candidates = {m["id"]: m for m in (vec_matches)}  # deduplicate
+        candidates = list(candidates.values())[:u_cap]
     timer.mark("deduplicate_cap")
     print(f"[HYBRID] deduplicate_cap took {timer.last - timer.start:.3f}s")
     print(f"[HYBRID] Final candidates: {len(candidates)}")
 
     # 5) RE-RANKING
     print("[HYBRID] Step 4: Re-ranking candidates...")
-    if candidates:
-        # If FlashRank Ranker is available, it exposes a `rerank` method
-        if hasattr(reranker, "rerank"):
-            print("[HYBRID] Using FlashRank reranker...")
-            passages = [{"id": c["id"], "text": c["text"], "meta": c["meta"]} for c in candidates]
-            request = RerankRequest(query=query, passages=passages)
-            try:
-                ranked = reranker.rerank(request)
-                # PRINT quick debug for demo
-                print("[FLASHRANK_RANKED]:", [r.get("id") for r in ranked])
-                for c in candidates:
-                    matching = next((r for r in ranked if r.get("id") == c.get("id")), None)
-                    if matching:
-                        c["scores"] = {"cross": float(matching.get("relevance_score", 0.0))}
-                    else:
-                        c["scores"] = {"cross": 0.0}
-            except Exception as e:
-                print(f"[hybrid_retrieve] FlashRank rerank failed: {e}")
-                # fallback: set neutral scores so later steps can handle
-                for c in candidates:
+    if not candidates:
+        print(f"[HYBRID] WARNING: No candidates to re-rank, returning empty list")
+        return []
+    
+    # Process re-ranking (we know candidates exist here)
+    # If FlashRank Ranker is available, it exposes a `rerank` method
+    if hasattr(reranker, "rerank"):
+        print("[HYBRID] Using FlashRank reranker...")
+        passages = [{"id": c["id"], "text": c["text"], "meta": c["meta"]} for c in candidates]
+        request = RerankRequest(query=query, passages=passages)
+        try:
+            ranked = reranker.rerank(request)
+            # PRINT quick debug for demo
+            print("[FLASHRANK_RANKED]:", [r.get("id") for r in ranked])
+            for c in candidates:
+                matching = next((r for r in ranked if r.get("id") == c.get("id")), None)
+                if matching:
+                    c["scores"] = {"cross": float(matching.get("relevance_score", 0.0))}
+                else:
                     c["scores"] = {"cross": 0.0}
-            timer.mark("flashrank.rerank")
-            print(f"[HYBRID] flashrank.rerank took {timer.last - timer.start:.3f}s")
-        else:
-            # Fallback: existing CrossEncoder.predict path
-            print("[HYBRID] Using CrossEncoder reranker...")
-            pairs = [(query, c["text"]) for c in candidates]
-            try:
-                scores = reranker.predict(pairs)
-                for i, c in enumerate(candidates):
-                    c["scores"] = {"cross": float(scores[i])}
-            except Exception as e:
-                print(f"[hybrid_retrieve] CrossEncoder predict failed: {e}")
-                for c in candidates:
-                    c["scores"] = {"cross": 0.0}
-            timer.mark("cross-encoder.predict")
-            print(f"[HYBRID] cross-encoder.predict took {timer.last - timer.start:.3f}s")
+        except Exception as e:
+            print(f"[hybrid_retrieve] FlashRank rerank failed: {e}")
+            # fallback: set neutral scores so later steps can handle
+            for c in candidates:
+                c["scores"] = {"cross": 0.0}
+        timer.mark("flashrank.rerank")
+        print(f"[HYBRID] flashrank.rerank took {timer.last - timer.start:.3f}s")
     else:
-        # no candidates
-        print("[HYBRID] No candidates found")
-        timer.mark("no_candidates")
+        # Fallback: existing CrossEncoder.predict path
+        print("[HYBRID] Using CrossEncoder reranker...")
+        pairs = [(query, c["text"]) for c in candidates]
+        try:
+            scores = reranker.predict(pairs)
+            for i, c in enumerate(candidates):
+                c["scores"] = {"cross": float(scores[i])}
+        except Exception as e:
+            print(f"[hybrid_retrieve] CrossEncoder predict failed: {e}")
+            for c in candidates:
+                c["scores"] = {"cross": 0.0}
+        timer.mark("cross-encoder.predict")
+        print(f"[HYBRID] cross-encoder.predict took {timer.last - timer.start:.3f}s")
 
     # 6) SORT CANDIDATES
     print("[HYBRID] Step 5: Sorting candidates by relevance score...")
@@ -1650,20 +1738,50 @@ def handle_chitchat(user_message: str, chat_history: str) -> str:
         return "Whoa, let's keep it polite, please! 😊"
 
 # -------------------- VIDEO MATCHING SYSTEM (SIMPLIFIED BERT APPROACH) --------------------
+# Import video embedding cache
+try:
+    import sys
+    from pathlib import Path
+    # Add current directory to path for local import
+    cache_module_path = Path(__file__).parent
+    if str(cache_module_path) not in sys.path:
+        sys.path.insert(0, str(cache_module_path))
+    from video_embedding_cache import VideoEmbeddingCache
+    VIDEO_CACHE_AVAILABLE = True
+except ImportError as e:
+    VIDEO_CACHE_AVAILABLE = False
+    print(f"[VIDEO_SYSTEM] WARNING: video_embedding_cache module not found ({e}), using fallback mode")
+
 class VideoMatchingSystem:
-    def __init__(self, video_file_path: str = "./FILES/video_link_topic.xlsx"):
+    def __init__(self, video_file_path: str = "./FILES/video_link_topic.xlsx", use_cache: bool = True):
         """Initialize the simplified video matching system using BERT similarity"""
         self.video_file_path = video_file_path
         self.topic_list = []  # List of topic strings
         self.url_list = []    # List of corresponding URLs
+        self.topic_embeddings = None  # Pre-computed embeddings
+        self.use_cache = use_cache and VIDEO_CACHE_AVAILABLE
         
-        # Load video data
-        self._load_video_data()
+        # Try to use cache first
+        if self.use_cache:
+            print("[VIDEO_SYSTEM] Initializing video embedding cache...")
+            self.embedding_cache = VideoEmbeddingCache(video_file_path=video_file_path)
+            if self.embedding_cache.initialize():
+                self.topic_list, self.url_list, self.topic_embeddings = self.embedding_cache.get_cached_embeddings()
+                print(f"[VIDEO_SYSTEM] Loaded {len(self.topic_list)} video embeddings from cache")
+            else:
+                print("[VIDEO_SYSTEM] Cache initialization failed, falling back to standard mode")
+                self.use_cache = False
         
-        # Initialize BERT model for similarity
-        print("[VIDEO_SYSTEM] Loading BERT model for semantic similarity...")
-        self.similarity_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-        print("[VIDEO_SYSTEM] BERT model loaded successfully")
+        # Fallback: Load video data and initialize model (if cache not available)
+        if not self.use_cache:
+            self._load_video_data()
+            # Initialize BERT model for similarity (only if not using cache)
+            print("[VIDEO_SYSTEM] Loading BERT model for semantic similarity...")
+            self.similarity_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+            print("[VIDEO_SYSTEM] BERT model loaded successfully")
+        else:
+            # For cache mode, model will be loaded lazily when encoding answers
+            self.similarity_model = None
     
     def _load_video_data(self):
         """Load and preprocess video data into simple lists using Description column"""
@@ -1691,7 +1809,7 @@ class VideoMatchingSystem:
             self.url_list = []
     
     def find_relevant_video(self, answer: str) -> Optional[str]:
-        """Find relevant video using BERT similarity (no LLM reconfirmation)"""
+        """Find relevant video using BERT similarity + LLM verification"""
         if not self.topic_list:
             return None
         
@@ -1701,9 +1819,17 @@ class VideoMatchingSystem:
         print("[VIDEO_SYSTEM] Step 1: Computing BERT semantic similarities...")
         bert_start = time.perf_counter()
         
-        # Encode answer and all topics
-        answer_embedding = self.similarity_model.encode([answer])
-        topic_embeddings = self.similarity_model.encode(self.topic_list)
+        # Use cached embeddings if available, otherwise encode on-the-fly
+        if self.use_cache and self.topic_embeddings is not None:
+            # Only encode the answer (embeddings for topics are pre-computed)
+            answer_embedding = self.embedding_cache.encode_answer(answer)
+            answer_embedding = answer_embedding.reshape(1, -1)  # Reshape for cosine_similarity
+            topic_embeddings = self.topic_embeddings
+            print(f"[VIDEO_SYSTEM] Using cached video embeddings ({len(self.topic_list)} videos)")
+        else:
+            # Fallback: encode answer and all topics (original behavior)
+            answer_embedding = self.similarity_model.encode([answer])
+            topic_embeddings = self.similarity_model.encode(self.topic_list)
         
         # Compute cosine similarities
         similarities = cosine_similarity(answer_embedding, topic_embeddings)[0]
@@ -1801,7 +1927,7 @@ class CacheSystem:
             self.answer_list = []
     
     def check_cache(self, reformulated_query: str) -> Optional[str]:
-        """Check cached question using BERT similarity (no LLM reconfirmation)"""
+        """Check if reformulated query matches any cached question using BERT + LLM verification"""
         if not self.question_list or not self.similarity_model:
             print("[CACHE_SYSTEM] No cache data or model available")
             return None
@@ -1961,9 +2087,10 @@ async def medical_pipeline_api(user_id: str, user_message: str, background_tasks
         reply = handle_chitchat(user_message, chat_history_context_for_llm)
         # Do not update or save chitchat history per request
         t_end = time.perf_counter()
+        total_time = t_end - start_time
         timer.total("request")
-        print(f"total took {t_end - start_time:.2f} secs")
-        return {"answer": reply, "intent": "chitchat", "follow_up": None}
+        print(f"total took {total_time:.2f} secs")
+        return {"answer": reply, "intent": "chitchat", "follow_up": None, "total_time": round(total_time, 3)}
 
     # Skip the old reformulation step since it's now combined above
 
@@ -2002,11 +2129,12 @@ async def medical_pipeline_api(user_id: str, user_message: str, background_tasks
         background_tasks.add_task(_background_update_and_save, user_id, user_message, cached_answer, "answer", history_pairs, current_summary)
         print("[pipeline] done with cached answer")
         t_end = time.perf_counter()
+        total_time = t_end - start_time
         timer.total("request")
-        print(f"total took {t_end - start_time:.2f} secs")
+        print(f"total took {total_time:.2f} secs")
         
         # Return cached response with video URL
-        response = {"answer": cached_answer, "intent": "answer", "follow_up": None}
+        response = {"answer": cached_answer, "intent": "answer", "follow_up": None, "total_time": round(total_time, 3)}
         if video_url:
             response["video_url"] = video_url
         else:
@@ -2030,9 +2158,10 @@ async def medical_pipeline_api(user_id: str, user_message: str, background_tasks
         msg = "Sorry I am not aware this topic, Please ask any other medical related terminologies"
         background_tasks.add_task(_background_update_and_save, user_id, user_message, msg, "no_context", history_pairs, current_summary)
         t_end = time.perf_counter()
+        total_time = t_end - start_time
         timer.total("request")
-        print(f"total took {t_end - start_time:.2f} secs")
-        return {"answer": msg, "intent": "no_context", "follow_up": None, "video_url": None}
+        print(f"total took {total_time:.2f} secs")
+        return {"answer": msg, "intent": "no_context", "follow_up": None, "video_url": None, "total_time": round(total_time, 3)}
 
     print("[pipeline] Step 5: bert_filter_candidates")
     # Use sample_answer for better semantic matching (answer-to-answer comparison)
@@ -2099,11 +2228,12 @@ async def medical_pipeline_api(user_id: str, user_message: str, background_tasks
         background_tasks.add_task(_background_update_and_save, user_id, user_message, answer, "answer", history_pairs, current_summary)
         print("[pipeline] done with answer")
         t_end = time.perf_counter()
+        total_time = t_end - start_time
         timer.total("request")
-        print(f"total took {t_end - start_time:.2f} secs")
+        print(f"total took {total_time:.2f} secs")
         
         # Return response with video URL
-        response = {"answer": answer, "intent": "answer", "follow_up": followup_q if followup_q else None}
+        response = {"answer": answer, "intent": "answer", "follow_up": followup_q if followup_q else None, "total_time": round(total_time, 3)}
         if video_url:
             response["video_url"] = video_url
         else:
@@ -2120,18 +2250,19 @@ async def medical_pipeline_api(user_id: str, user_message: str, background_tasks
         background_tasks.add_task(_background_update_and_save, user_id, user_message, msg, "no_context", history_pairs, current_summary)
         print("[pipeline] done with no_context")
         t_end = time.perf_counter()
+        total_time = t_end - start_time
         timer.total("request")
-        print(f"total took {t_end - start_time:.2f} secs")
+        print(f"total took {total_time:.2f} secs")
         
         # Return response with video URL (None for no_context)
-        return {"answer": msg, "intent": "no_context", "follow_up": None, "video_url": None}
+        return {"answer": msg, "intent": "no_context", "follow_up": None, "video_url": None, "total_time": round(total_time, 3)}
 
 
 # -------------------- API ENDPOINTS --------------------
 @app.on_event("startup")
 async def startup_event():
-    global embedding_model, reranker, pinecone_index, llm, summarizer_llm, reformulate_llm, classifier_llm, gemini_llm, EMBED_DIM, video_system, cache_system
-    print("[startup] Initializing models and Pinecone client...")
+    global embedding_model, reranker, chromadb_collection, llm, summarizer_llm, reformulate_llm, classifier_llm, gemini_llm, EMBED_DIM, video_system, cache_system
+    print("[startup] Initializing models and ChromaDB client...")
     t = CheckpointTimer("startup")
     embedding_model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
     t.mark("load_embedding_model")
@@ -2145,15 +2276,49 @@ async def startup_event():
         reranker = CrossEncoder(CROSS_ENCODER_MODEL)
         t.mark("load_reranker_fallback")
 
-    pc = Pinecone(api_key=PINECONE_KEY)
-    t.mark("init_pinecone_client")
-    if INDEX_NAME not in pc.list_indexes().names():
-        print("[startup] Creating Pinecone index (if needed)...")
-        pc.create_index(name=INDEX_NAME, dimension=EMBED_DIM, metric="cosine",
-                        spec=ServerlessSpec(cloud="aws", region="us-east-1"))
-        t.mark("create_pinecone_index")
-    pinecone_index = pc.Index(INDEX_NAME)
-    t.mark("pinecone_index_ready")
+    # Initialize ChromaDB
+    if not CHROMADB_AVAILABLE:
+        raise RuntimeError("ChromaDB not available. Install with: pip install chromadb")
+    
+    VECTORSTORE_DIR = Path("FILES/local_vectorstore")
+    if not VECTORSTORE_DIR.exists():
+        print(f"[startup] WARNING: ChromaDB not found at {VECTORSTORE_DIR}")
+        print("[startup] Please run setup_local_vectorstore.py first to create the vector store")
+        raise RuntimeError("ChromaDB vector store not found. Run setup_local_vectorstore.py first.")
+    
+    client = chromadb.PersistentClient(
+        path=str(VECTORSTORE_DIR),
+        settings=Settings(anonymized_telemetry=False)
+    )
+    t.mark("init_chromadb_client")
+    
+    try:
+        chromadb_collection = client.get_collection(name="medical_documents")
+        collection_count = chromadb_collection.count()
+        if collection_count == 0:
+            print(f"[startup] WARNING: ChromaDB collection loaded but is EMPTY ({collection_count} chunks)")
+            print("[startup] Please run setup_local_vectorstore.py to populate the collection")
+        else:
+            print(f"[startup] ChromaDB collection loaded successfully with {collection_count} chunks")
+        
+        # Verify collection has the expected structure
+        try:
+            # Try a dummy query to verify collection is functional
+            test_embedding = [0.0] * EMBED_DIM
+            test_results = chromadb_collection.query(
+                query_embeddings=[test_embedding],
+                n_results=1
+            )
+            print(f"[startup] ChromaDB collection verified and ready")
+        except Exception as e:
+            print(f"[startup] WARNING: ChromaDB collection verification failed: {e}")
+            print("[startup] Collection may not be properly initialized")
+    except Exception as e:
+        print(f"[startup] ERROR: Could not load ChromaDB collection: {e}")
+        print("[startup] Please run setup_local_vectorstore.py first to create the vector store")
+        raise RuntimeError(f"ChromaDB collection not found: {e}")
+    
+    t.mark("chromadb_collection_ready")
 
     # Initialize OpenAI models
     llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0.0, api_key=OPENAI_API_KEY)

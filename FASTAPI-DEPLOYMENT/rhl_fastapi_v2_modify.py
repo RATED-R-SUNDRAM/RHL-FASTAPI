@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
+from fastapi.responses import StreamingResponse
 import aiosqlite
 from typing import List, Tuple, Dict, Any
 
@@ -843,7 +844,7 @@ BAD (Won't match documents well):
 <user_query>
 {query}
 </user_query>
-
+IMPORTANT: If chunks in <context> seem partially relevant or borderline, still use them - your role is to judge and extract useful information. Only exclude chunks that are completely unrelated to the query.
 <context>
 {context}
 </context>
@@ -1645,6 +1646,48 @@ def synthesize_answer(query: str, top_candidates: List[Dict[str, Any]], context_
     timer.mark("synthesize_llm.invoke")
 
     return resp
+
+async def synthesize_answer_stream(query: str, top_candidates: List[Dict[str, Any]], context_followup: str, main_llm: ChatGoogleGenerativeAI | None = None):
+    """
+    Streaming version of synthesize_answer that yields tokens as they arrive.
+    Returns an async generator that yields token chunks.
+    """
+    global gemini_llm
+
+    if main_llm is None:
+        main_llm = gemini_llm
+
+    # Build context from top candidates (same as non-streaming version)
+    sources = []
+    ctx_parts = []
+    for c in top_candidates[:4]:
+        src = c.get("meta", {}).get("doc_name", "unknown")
+        if src not in sources:
+            sources.append(src)
+        src_expanded = expand_document_name(src) if src else "unknown"
+        ctx_parts.append(f"From [{src_expanded}]:\\n{c['text']}")
+    context = "\\n\\n".join(ctx_parts)
+    context_followup_str = context_followup
+    sources_str = expand_sources_string(sources) if sources else "unknown"
+    print(f"[synthesize_answer_stream] Expanded sources: {sources_str}")
+
+    prompt = answer_prompt.format(
+        sources=sources_str,
+        context=context,
+        context_followup=context_followup_str or "",
+        query=query
+    )
+    print("[answer_stream] sending synthesis prompt to GEMINI LLM (streaming mode)")
+
+    try:
+        # Use astream for async streaming
+        async for chunk in main_llm.astream([HumanMessage(content=prompt)]):
+            if chunk.content:
+                yield chunk.content
+    except Exception as e:
+        print(f"[synthesize_answer_stream] Error during streaming: {e}")
+        # Fallback: yield error message
+        yield f"\n[Error: {str(e)}]"
 
 # -------------------- CLASSIFY / REFORMULATE / CHITCHAT --------------------
 def classify_message(chat_history: str, user_message: str) -> Tuple[str, str]:
@@ -2720,6 +2763,152 @@ async def test_debug_endpoint():
     print("="*60)
     return {"status": "debug_test_working", "message": "Check server console for debug output"}
 
+async def medical_pipeline_api_stream(user_id: str, user_message: str, background_tasks: BackgroundTasks):
+    """
+    Streaming version of medical_pipeline_api that yields SSE events.
+    Returns an async generator that yields formatted SSE data.
+    """
+    timer = CheckpointTimer("medical_pipeline_api_stream")
+    start_time = time.perf_counter()
+
+    try:
+        history_pairs, current_summary = await get_history(user_id)
+        chat_history_context_for_llm, last_3_qa_pairs = get_chat_context(history_pairs, current_summary)
+        
+        # Combined classification + reformulation
+        label, reason, rewritten, correction, sample_answer = classify_and_reformulate(
+            chat_history_context_for_llm, user_message, last_3_qa_pairs
+        )
+
+        # Handle chitchat - send full response immediately
+        if label == "CHITCHAT":
+            reply = handle_chitchat(user_message, chat_history_context_for_llm)
+            await save_history(user_id, user_message, reply, "chitchat", current_summary)
+            
+            # Stream chitchat response word by word for better UX
+            words = reply.split()
+            for word in words:
+                yield f"data: {json.dumps({'type': 'token', 'content': word + ' '})}\n\n"
+                await asyncio.sleep(0.01)  # Small delay for smooth streaming
+            
+            yield f"data: {json.dumps({'type': 'metadata', 'intent': 'chitchat', 'follow_up': None, 'video_url': None, 'total_time': round(time.perf_counter() - start_time, 3)})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+        # Handle cache check
+        cache_answer = None
+        if cache_system:
+            cache_answer = cache_system.check_cache(sample_answer, rewritten)
+            if cache_answer:
+                # Stream cached answer word by word
+                words = cache_answer.split()
+                for word in words:
+                    yield f"data: {json.dumps({'type': 'token', 'content': word + ' '})}\n\n"
+                    await asyncio.sleep(0.01)  # Small delay for smooth streaming
+                
+                # Get video URL for cached answer
+                video_url = None
+                if video_system:
+                    video_url = video_system.find_relevant_video(cache_answer)
+                
+                background_tasks.add_task(_background_update_and_save, user_id, user_message, cache_answer, "answer", history_pairs, current_summary)
+                yield f"data: {json.dumps({'type': 'metadata', 'intent': 'answer', 'follow_up': None, 'video_url': video_url, 'total_time': round(time.perf_counter() - start_time, 3)})}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+        # Hybrid retrieval
+        candidates = hybrid_retrieve(rewritten)
+        
+        if not candidates:
+            msg = "I apologize, but I do not have sufficient information in my documents to answer this question accurately."
+            # Stream no_context message word by word
+            words = msg.split()
+            for word in words:
+                yield f"data: {json.dumps({'type': 'token', 'content': word + ' '})}\n\n"
+                await asyncio.sleep(0.01)
+            
+            background_tasks.add_task(_background_update_and_save, user_id, user_message, msg, "no_context", history_pairs, current_summary)
+            yield f"data: {json.dumps({'type': 'metadata', 'intent': 'no_context', 'follow_up': None, 'video_url': None, 'total_time': round(time.perf_counter() - start_time, 3)})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+        # Filter candidates
+        filtered = bert_filter_candidates(candidates, sample_answer, rewritten, min_score=0.35)
+
+        if not filtered["answer_chunks"]:
+            msg = "I apologize, but I do not have sufficient information in my documents to answer this question accurately."
+            # Stream no_context message word by word
+            words = msg.split()
+            for word in words:
+                yield f"data: {json.dumps({'type': 'token', 'content': word + ' '})}\n\n"
+                await asyncio.sleep(0.01)
+            
+            background_tasks.add_task(_background_update_and_save, user_id, user_message, msg, "no_context", history_pairs, current_summary)
+            yield f"data: {json.dumps({'type': 'metadata', 'intent': 'no_context', 'follow_up': None, 'video_url': None, 'total_time': round(time.perf_counter() - start_time, 3)})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+        # Get top chunks and followup
+        top4 = filtered["answer_chunks"]
+        followup_candidates = filtered["followup_chunks"]
+        followup_q = ""
+        
+        if followup_candidates:
+            followup_texts = []
+            for fc in followup_candidates[:2]:
+                chunk_text = fc.get("text", "")
+                if chunk_text and len(chunk_text.strip()) > 0:
+                    truncated_text = chunk_text[:500] if len(chunk_text) > 500 else chunk_text
+                    followup_texts.append(truncated_text)
+            if followup_texts:
+                followup_q = "\n\n".join(followup_texts)
+
+        # Apply correction prefix if needed (stream it first)
+        if label != "FOLLOW_UP" and correction:
+            correction_msg = "I guess you meant " + " and ".join(correction.values()) + "\n"
+            words = correction_msg.split()
+            for word in words:
+                yield f"data: {json.dumps({'type': 'token', 'content': word + ' '})}\n\n"
+                await asyncio.sleep(0.01)
+
+        # Stream answer tokens
+        full_answer = ""
+        async for token_chunk in synthesize_answer_stream(rewritten, top4, followup_q, gemini_llm):
+            full_answer += token_chunk
+            yield f"data: {json.dumps({'type': 'token', 'content': token_chunk})}\n\n"
+
+        # Add correction prefix to full_answer for saving
+        if label != "FOLLOW_UP" and correction:
+            correction_msg = "I guess you meant " + " and ".join(correction.values()) + "\n"
+            full_answer = correction_msg + full_answer
+
+        # Find video URL
+        video_url = None
+        if video_system:
+            video_url = video_system.find_relevant_video(full_answer)
+
+        # Extract follow-up question from full_answer if present
+        follow_up_question = None
+        if "Would you like to know about" in full_answer or "would you like to know about" in full_answer:
+            follow_match = re.search(r'[Ww]ould you like to know about ([^?]+)', full_answer)
+            if follow_match:
+                follow_up_question = follow_match.group(1).strip()
+
+        # Schedule background save
+        background_tasks.add_task(_background_update_and_save, user_id, user_message, full_answer, "answer", history_pairs, current_summary)
+
+        # Send metadata
+        yield f"data: {json.dumps({'type': 'metadata', 'intent': 'answer', 'follow_up': follow_up_question, 'video_url': video_url, 'total_time': round(time.perf_counter() - start_time, 3)})}\n\n"
+        yield "data: [DONE]\n\n"
+
+    except Exception as e:
+        print(f"[medical_pipeline_api_stream] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        error_msg = f"Internal server error: {str(e)}"
+        yield f"data: {json.dumps({'type': 'error', 'message': error_msg})}\n\n"
+        yield "data: [DONE]\n\n"
+
 @app.get("/chat")
 async def chat_endpoint(
     user_id: str = Query(..., description="Unique identifier for the user"),
@@ -2732,6 +2921,23 @@ async def chat_endpoint(
     except Exception as e:
         print(f"[chat_endpoint] Error for user {user_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
+
+@app.get("/chat-stream")
+async def chat_stream_endpoint(
+    user_id: str = Query(..., description="Unique identifier for the user"),
+    message: str = Query(..., description="The user's message or query"),
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
+    """
+    Streaming endpoint that returns Server-Sent Events (SSE) format.
+    Each event contains either a token or metadata.
+    Format: data: {"type": "token|metadata|error", ...}\n\n
+    """
+    async def generate():
+        async for event in medical_pipeline_api_stream(user_id, message, background_tasks):
+            yield event
+    
+    return StreamingResponse(generate(), media_type="text/event-stream")
 
 if __name__ == "__main__":
     import uvicorn

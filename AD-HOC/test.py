@@ -38,3 +38,5 @@ print(df[['video_topic']].head(10))
 # Save processed data
 df.to_excel("D:\\RHL-WH\\RHL-FASTAPI\\FILES\\video_link_topic.xlsx", index=False)
 print(f"\nSaved processed data to video_link_topic.xlsx")
+
+#%% 
