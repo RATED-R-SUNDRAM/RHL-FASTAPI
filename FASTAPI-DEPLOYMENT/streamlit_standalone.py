@@ -166,17 +166,71 @@ for msg in st.session_state.messages:
 # Helper to run async pipeline
 async def process_message_streaming(user_id: str, message: str):
     """Process message with streaming support."""
-    background_tasks = BackgroundTasks()
+    # Create background tasks container to capture tasks
+    # CRITICAL: FastAPI BackgroundTasks don't execute automatically outside FastAPI request context
+    # So we need to capture and execute them manually
+    class BackgroundTasksContainer:
+        def __init__(self):
+            self.tasks = []
+        
+        def add_task(self, func, *args, **kwargs):
+            # Capture the task with its arguments
+            self.tasks.append((func, args, kwargs))
     
-    # Run the full pipeline
+    background_tasks = BackgroundTasksContainer()
+    
+    # Run the full pipeline (it will add tasks to our container)
     result = await medical_pipeline_api(user_id, message, background_tasks)
+    
+    # MANUALLY EXECUTE background tasks since FastAPI context doesn't exist in Streamlit
+    # This is critical - without this, history is never saved and follow-ups can't work
+    if background_tasks.tasks:
+        print("[STREAMLIT_STANDALONE] Executing background tasks manually...")
+        for task_func, task_args, task_kwargs in background_tasks.tasks:
+            # Execute the captured task with its original arguments
+            try:
+                if task_kwargs:
+                    await task_func(*task_args, **task_kwargs)
+                else:
+                    await task_func(*task_args)
+                print(f"[STREAMLIT_STANDALONE] Background task executed: {task_func.__name__}")
+            except Exception as e:
+                print(f"[STREAMLIT_STANDALONE] Error executing background task: {e}")
     
     return result
 
 async def process_message_standard(user_id: str, message: str):
     """Process message in standard mode."""
-    background_tasks = BackgroundTasks()
+    # Create background tasks container to capture tasks
+    # CRITICAL: FastAPI BackgroundTasks don't execute automatically outside FastAPI request context
+    # So we need to capture and execute them manually
+    class BackgroundTasksContainer:
+        def __init__(self):
+            self.tasks = []
+        
+        def add_task(self, func, *args, **kwargs):
+            # Capture the task with its arguments
+            self.tasks.append((func, args, kwargs))
+    
+    background_tasks = BackgroundTasksContainer()
+    
     result = await medical_pipeline_api(user_id, message, background_tasks)
+    
+    # MANUALLY EXECUTE background tasks since FastAPI context doesn't exist in Streamlit
+    # This is critical - without this, history is never saved and follow-ups can't work
+    if background_tasks.tasks:
+        print("[STREAMLIT_STANDALONE] Executing background tasks manually...")
+        for task_func, task_args, task_kwargs in background_tasks.tasks:
+            # Execute the captured task with its original arguments
+            try:
+                if task_kwargs:
+                    await task_func(*task_args, **task_kwargs)
+                else:
+                    await task_func(*task_args)
+                print(f"[STREAMLIT_STANDALONE] Background task executed: {task_func.__name__}")
+            except Exception as e:
+                print(f"[STREAMLIT_STANDALONE] Error executing background task: {e}")
+    
     return result
 
 # Chat input
