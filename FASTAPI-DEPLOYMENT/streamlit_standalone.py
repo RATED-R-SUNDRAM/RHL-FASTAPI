@@ -53,6 +53,8 @@ st.markdown("**✨ Integrated Frontend + Backend - Single deployment!**")
 st.sidebar.header("⚙️ Configuration")
 user_id = st.sidebar.text_input("User ID", value="demo_user")
 stream_mode = st.sidebar.radio("Response Mode", ["Streaming", "Standard"], index=0)
+# Testing option: Bypass cache to go directly to retrieval + LLM
+bypass_cache = st.sidebar.checkbox("🚫 Bypass Cache (Testing)", value=False, help="Skip cache check and go directly to retrieval + LLM")
 
 # Initialize backend models (cached - runs only once)
 @st.cache_resource
@@ -164,7 +166,7 @@ for msg in st.session_state.messages:
                     st.info(f"💡 Follow-up: {msg['metadata']['follow_up']}")
 
 # Helper to run async pipeline
-async def process_message_streaming(user_id: str, message: str):
+async def process_message_streaming(user_id: str, message: str, bypass_cache: bool = False):
     """Process message with streaming support."""
     # Create background tasks container to capture tasks
     # CRITICAL: FastAPI BackgroundTasks don't execute automatically outside FastAPI request context
@@ -179,8 +181,20 @@ async def process_message_streaming(user_id: str, message: str):
     
     background_tasks = BackgroundTasksContainer()
     
+    # TESTING: Bypass cache if enabled
+    original_cache_system = None
+    if bypass_cache:
+        print("[STREAMLIT_STANDALONE] ⚠️ CACHE BYPASS ENABLED - Skipping cache check for testing")
+        original_cache_system = backend.cache_system
+        backend.cache_system = None  # Temporarily disable cache
+    
     # Run the full pipeline (it will add tasks to our container)
     result = await medical_pipeline_api(user_id, message, background_tasks)
+    
+    # Restore cache system after pipeline
+    if bypass_cache and original_cache_system is not None:
+        backend.cache_system = original_cache_system
+        print("[STREAMLIT_STANDALONE] Cache system restored")
     
     # MANUALLY EXECUTE background tasks since FastAPI context doesn't exist in Streamlit
     # This is critical - without this, history is never saved and follow-ups can't work
@@ -199,7 +213,7 @@ async def process_message_streaming(user_id: str, message: str):
     
     return result
 
-async def process_message_standard(user_id: str, message: str):
+async def process_message_standard(user_id: str, message: str, bypass_cache: bool = False):
     """Process message in standard mode."""
     # Create background tasks container to capture tasks
     # CRITICAL: FastAPI BackgroundTasks don't execute automatically outside FastAPI request context
@@ -214,7 +228,19 @@ async def process_message_standard(user_id: str, message: str):
     
     background_tasks = BackgroundTasksContainer()
     
+    # TESTING: Bypass cache if enabled
+    original_cache_system = None
+    if bypass_cache:
+        print("[STREAMLIT_STANDALONE] ⚠️ CACHE BYPASS ENABLED - Skipping cache check for testing")
+        original_cache_system = backend.cache_system
+        backend.cache_system = None  # Temporarily disable cache
+    
     result = await medical_pipeline_api(user_id, message, background_tasks)
+    
+    # Restore cache system after pipeline
+    if bypass_cache and original_cache_system is not None:
+        backend.cache_system = original_cache_system
+        print("[STREAMLIT_STANDALONE] Cache system restored")
     
     # MANUALLY EXECUTE background tasks since FastAPI context doesn't exist in Streamlit
     # This is critical - without this, history is never saved and follow-ups can't work
@@ -267,9 +293,9 @@ if prompt := st.chat_input("Ask a medical question..."):
                     # For streaming, we'll use the standard pipeline but display progressively
                     # Note: True streaming requires the streaming endpoint, but for standalone
                     # we'll simulate it with progressive display
-                    result = loop.run_until_complete(process_message_streaming(user_id, prompt))
+                    result = loop.run_until_complete(process_message_streaming(user_id, prompt, bypass_cache))
                 else:
-                    result = loop.run_until_complete(process_message_standard(user_id, prompt))
+                    result = loop.run_until_complete(process_message_standard(user_id, prompt, bypass_cache))
                 
                 total_time = time.time() - request_start
                 full_response = result.get('answer', '')
