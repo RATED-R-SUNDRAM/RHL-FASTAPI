@@ -5,7 +5,7 @@ import asyncio
 import re
 from pathlib import Path
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 import aiosqlite
 from typing import List, Tuple, Dict, Any
@@ -754,23 +754,30 @@ STEP 3 - REASONING-BASED ANSWER GENERATION:
 - STOP adding points once the query is fully answered
 
 
-STEP 4 - FOLLOW-UP QUESTION (MANDATORY IF context_followup PROVIDED):
-- If <context_followup> is non-empty, you MUST include a follow-up question
+STEP 4 - FOLLOW-UP QUESTION (CONDITIONAL - ONLY IF CLOSELY RELATED):
+- Follow-up questions should ONLY be provided if there is VERY CLOSE RESEMBLANCE between the answer topic and the follow-up context topic
+- CRITICAL RULE: Before generating a follow-up, analyze if the <context_followup> topic is an EXTENSION or CLOSELY RELATED aspect of the answer topic
+  * ✅ INCLUDE follow-up if: The follow-up context discusses the SAME medical condition/topic as your answer (e.g., answer about jaundice → follow-up about complications of jaundice, treatment of jaundice, prevention of jaundice)
+  * ❌ EXCLUDE follow-up if: The follow-up context discusses a DIFFERENT medical condition/topic (e.g., answer about jaundice → follow-up about blood pressure, diabetes, or any unrelated topic)
 - Format: "Would you like to know about <topic from context_followup>?" (without bullet points, at the end of answer)
 - Follow-up should be about a medical topic (not general/document titles like "Clinical Reference Manual for Advanced Neonatal Care in Ethiopia" ❌)
 - Follow-up should NOT overlap with information already in the answer
 - The follow-up must be STRICTLY from context_followup
 
 CRITICAL FOR FOLLOW-UP GENERATION:
-- Read the ENTIRE context_followup content carefully
-- Extract the MAIN MEDICAL TOPIC or KEY TERM from context_followup
+- FIRST: Identify the MAIN TOPIC of your answer (e.g., "jaundice", "pre-eclampsia", "newborn feeding")
+- SECOND: Read the ENTIRE context_followup content carefully
+- THIRD: Extract the MAIN MEDICAL TOPIC or KEY TERM from context_followup
+- FOURTH: Compare the topics - Are they the SAME medical condition/topic or closely related aspects?
+  * If YES (same topic, different aspect) → Generate follow-up question
+  * If NO (different topic entirely) → DO NOT generate follow-up question
 - Look for medical conditions, treatments, symptoms, complications, or procedures mentioned
 - Generate a question that will match relevant medical documents when searched
 - Use specific medical terminology that appears in medical documents
 - Avoid generic phrases - use precise medical terms (e.g., "treatment for jaundice" not "more information")
 - Ensure the question format matches how medical documents are indexed (e.g., "What are the complications of X?", "How to manage Y?", "What are the symptoms of Z?")
 - The question should be searchable and will retrieve relevant chunks from the document database
-- If context_followup contains multiple topics, pick the most relevant/interesting one that doesn't overlap with your answer
+- If context_followup contains multiple topics, pick the one that is MOST CLOSELY RELATED to your answer topic
 
 EXAMPLES:
 
@@ -885,7 +892,7 @@ According to hydration_guide, emergency_care:
 
 ---
 
-Example 5 - Follow-up Question Generation:
+Example 5 - Follow-up Question Generation (CLOSELY RELATED - INCLUDE):
 Query: "What causes jaundice?"
 Context:
 From [jaundice_guide.pdf]:
@@ -895,6 +902,7 @@ Followup Context:
 From [complications_guide.pdf]:
 Complications of jaundice include liver damage, kernicterus in newborns, and chronic liver disease.
 
+Analysis: Answer topic = "jaundice", Follow-up topic = "complications of jaundice" → SAME topic (jaundice), different aspect (complications) → ✅ CLOSELY RELATED → INCLUDE follow-up
 Answer:
 According to jaundice_guide:
 • Jaundice is caused by bilirubin buildup in the blood
@@ -903,7 +911,49 @@ According to jaundice_guide:
 
 Would you like to know about complications of jaundice?
 
-Note: The follow-up question extracted the main medical topic "complications of jaundice" from the followup_context, which is a specific, searchable medical term that will match documents.
+Note: The follow-up question extracted the main medical topic "complications of jaundice" from the followup_context, which is a specific, searchable medical term that will match documents. This is included because it's an extension of the same topic (jaundice).
+
+---
+
+Example 5b - Follow-up Question Generation (DIFFERENT TOPIC - EXCLUDE):
+Query: "What causes jaundice?"
+Context:
+From [jaundice_guide.pdf]:
+Jaundice is caused by bilirubin buildup...
+
+Followup Context:
+From [blood_pressure_guide.pdf]:
+Blood pressure management involves monitoring systolic and diastolic readings. High blood pressure can lead to cardiovascular complications.
+
+Analysis: Answer topic = "jaundice", Follow-up topic = "blood pressure" → DIFFERENT topics entirely → ❌ NOT CLOSELY RELATED → EXCLUDE follow-up
+Answer:
+According to jaundice_guide:
+• Jaundice is caused by bilirubin buildup in the blood
+• Common causes include liver diseases and hemolytic anemia
+• Newborn jaundice is common due to immature liver function
+
+Note: No follow-up question is included because the follow-up context discusses "blood pressure", which is a completely different medical topic from "jaundice" (the answer topic). Follow-ups should only be provided when they are extensions or closely related aspects of the same topic.
+
+---
+
+Example 5c - Follow-up Question Generation (SAME TOPIC, DIFFERENT ASPECT - INCLUDE):
+Query: "What are the symptoms of jaundice?"
+Context:
+From [symptom_guide.pdf]:
+Jaundice symptoms include yellowing of skin, yellowing of eyes, dark urine.
+
+Followup Context:
+From [treatment_guide.pdf]:
+Treatment of jaundice involves phototherapy for newborns, addressing underlying liver conditions, and in severe cases, exchange transfusion.
+
+Analysis: Answer topic = "jaundice" (symptoms), Follow-up topic = "treatment of jaundice" → SAME topic (jaundice), different aspect (treatment) → ✅ CLOSELY RELATED → INCLUDE follow-up
+Answer:
+According to symptom_guide:
+• Yellowing of skin and eyes (sclera) is the primary visible symptom
+• Dark urine indicates bile pigment changes
+• Pale stools may occur in some cases
+
+Would you like to know about treatment of jaundice?
 
 ---
 
@@ -1203,13 +1253,17 @@ INSTRUCTIONS:
 5. Assess confidence: Only answer if you can logically explain how chunks support your answer
 6. Synthesize information from multiple sources (use format: "According to A, B, C" when multiple sources contribute)
 7. Generate answer following all rules above - be confident if reasoning is clear, be honest if it fails
-8. MANDATORY: If <followup_context> is provided and non-empty, you MUST include a follow-up question at the end
-   - Read the entire <followup_context> content
-   - Extract the MAIN MEDICAL TOPIC or KEY TERM from <followup_context>
-   - Generate: "Would you like to know about [specific medical topic]?"
+8. CONDITIONAL: If <followup_context> is provided and non-empty, evaluate if follow-up should be included:
+   - FIRST: Identify the MAIN TOPIC of your answer (e.g., "jaundice", "pre-eclampsia", "newborn feeding")
+   - SECOND: Read the entire <followup_context> content
+   - THIRD: Extract the MAIN MEDICAL TOPIC or KEY TERM from <followup_context>
+   - FOURTH: Compare topics - Are they the SAME medical condition/topic or closely related aspects?
+     * ✅ INCLUDE follow-up if: Same topic, different aspect (e.g., answer about jaundice → follow-up about complications/treatment/prevention of jaundice)
+     * ❌ EXCLUDE follow-up if: Different topic entirely (e.g., answer about jaundice → follow-up about blood pressure, diabetes, or any unrelated topic)
+   - If INCLUDING: Generate "Would you like to know about [specific medical topic]?" (without bullet points, at the end of answer)
    - Use precise medical terminology that will match document searches
    - Example: "Would you like to know about jaundice treatment?" (not "Would you like more information?")
-   - The follow-up question should be the LAST line of your response
+   - The follow-up question should be the LAST line of your response (only if included)
 
 CRITICAL REASONING PRINCIPLES: 
 - Think step-by-step: What does each chunk tell you? How can you connect them to answer the query?
@@ -1221,7 +1275,7 @@ CRITICAL REASONING PRINCIPLES:
 - If you cannot reason a confident answer → Respond with: "I couldn't find sufficient information in the provided documents to answer this question accurately."
 - NEVER use external knowledge - only reason within provided chunks
 
-REMINDER: If <followup_context> is provided, you MUST generate a follow-up question. Do not skip this step.
+REMINDER: If <followup_context> is provided, evaluate if the follow-up topic is closely related to your answer topic. Only include a follow-up question if there is very close resemblance (same medical condition/topic, different aspect). If the follow-up context discusses a different medical topic entirely, DO NOT include a follow-up question.
 
 Write the final answer now.
 """
@@ -3351,6 +3405,81 @@ async def chat_stream_endpoint(
             yield event
     
     return StreamingResponse(generate(), media_type="text/event-stream")
+
+@app.websocket("/chat-ws")
+async def chat_websocket_endpoint(websocket: WebSocket):
+    """
+    WebSocket endpoint for streaming chat responses.
+    Client sends: {"user_id": "...", "message": "..."}
+    Server sends: {"type": "token|metadata|error", "content": "..."} or {"type": "metadata", ...}
+    """
+    await websocket.accept()
+    print(f"[WEBSOCKET] Client connected: {websocket.client}")
+    
+    try:
+        # Receive initial message with user_id and message
+        data = await websocket.receive_json()
+        user_id = data.get("user_id", "default_user")
+        user_message = data.get("message", "")
+        
+        print(f"[WEBSOCKET] Received: user_id={user_id}, message={user_message[:50]}...")
+        
+        # Create background tasks container
+        class BackgroundTasksContainer:
+            def __init__(self):
+                self.tasks = []
+            def add_task(self, func, *args, **kwargs):
+                self.tasks.append((func, args, kwargs))
+        
+        background_tasks = BackgroundTasksContainer()
+        
+        # Run streaming pipeline
+        async for event in medical_pipeline_api_stream(user_id, user_message, background_tasks):
+            # Parse SSE format to extract JSON
+            if event.startswith("data: "):
+                event_data = event[6:].strip()  # Remove "data: " prefix
+                
+                if event_data == "[DONE]":
+                    await websocket.send_json({"type": "done"})
+                    break
+                
+                try:
+                    # Parse JSON from SSE format
+                    json_data = json.loads(event_data)
+                    # Send as WebSocket JSON message
+                    await websocket.send_json(json_data)
+                except json.JSONDecodeError:
+                    continue
+        
+        # Execute background tasks manually (similar to streamlit_standalone)
+        if background_tasks.tasks:
+            print("[WEBSOCKET] Executing background tasks...")
+            for task_func, task_args, task_kwargs in background_tasks.tasks:
+                try:
+                    if task_kwargs:
+                        await task_func(*task_args, **task_kwargs)
+                    else:
+                        await task_func(*task_args)
+                except Exception as e:
+                    print(f"[WEBSOCKET] Error executing background task: {e}")
+        
+        print(f"[WEBSOCKET] Stream completed, closing connection")
+        
+    except WebSocketDisconnect:
+        print(f"[WEBSOCKET] Client disconnected")
+    except Exception as e:
+        print(f"[WEBSOCKET] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            await websocket.send_json({"type": "error", "message": str(e)})
+        except:
+            pass
+    finally:
+        try:
+            await websocket.close()
+        except:
+            pass
 
 if __name__ == "__main__":
     import uvicorn
