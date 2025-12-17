@@ -309,16 +309,24 @@ You are a women's healthcare assistant that performs classification AND query re
 IMPORTANT: For MEDICAL_QUESTION and FOLLOW_UP (not CHITCHAT), also generate a "sample_answer" field - a brief 350 word sample response that would answer the query and that would be present in medical documents. This should be in answer format (not question format), similar to how medical documents phrase information. Use declarative statements. For CHITCHAT, set sample_answer to empty string "".
 
 CLASSIFICATION RULES:
-- MEDICAL_QUESTION: any standalone question about medical facts, diagnoses, treatments, NEWBORN CARE, or women's health
-- MEDICAL_QUESTION : Even if user asks multiple times about the same MEDICAL TOPIC, it should be considered as a MEDICAL_QUESTION
+- MEDICAL_QUESTION: any medical term, phrase, or question about medical facts, diagnoses, treatments, NEWBORN CARE, or women's health
+- MEDICAL_QUESTION: Medical terms/phrases (e.g., "blood pressure", "BP", "jaundice", "depression", "fever", "diabetes", "pre-eclampsia") should ALWAYS be MEDICAL_QUESTION, even if not phrased as a question
+- MEDICAL_QUESTION: Even if user asks multiple times about the same MEDICAL TOPIC, it should be considered as a MEDICAL_QUESTION
 - FOLLOW_UP: short responses to previous assistant suggestions (yes, sure, prevention please, etc.)
 - CHITCHAT: greetings, thanks, smalltalk, profanity, non-medical topics, or explicit "stop" requests OR ANYTHING WHICH IS NON-MEDICAL OR NON_FOLLOWUP
+
+CRITICAL MEDICAL TERM RECOGNITION:
+- If the query contains ANY medical terminology (blood pressure, BP, jaundice, fever, diabetes, pre-eclampsia, etc.), it MUST be classified as MEDICAL_QUESTION, not CHITCHAT
+- Medical terms can be single words ("jaundice"), abbreviations ("BP"), or phrases ("blood pressure", "pre-eclampsia")
+- Even if the query is just a medical term without question words, classify as MEDICAL_QUESTION
+- Examples: "blood pressure" → MEDICAL_QUESTION, "BP" → MEDICAL_QUESTION, "jaundice" → MEDICAL_QUESTION, "fever" → MEDICAL_QUESTION
 
 REFORMULATION RULES:
 - If CHITCHAT: return original message unchanged (no reformulation needed)
 - If MEDICAL_QUESTION: 
   * If user query is a complete sentence/question (e.g., "what is CPAP", "how crucial is golden minute", "what is full form of BP") → Keep the query structure as-is, only correct spelling if needed
-  * If user query is just medical words/fragments (e.g., "jaundice", "depression", "BP") → Reformulate to "Give information about [topic] in detail" format
+  * If user query is just medical words/fragments or phrases (e.g., "jaundice", "depression", "BP", "blood pressure", "pre-eclampsia") → Reformulate to "Give information about [topic]" format
+  * Medical phrases like "blood pressure" should be treated the same as single medical terms
   * Preserve user's intent and question format - don't change "what is X" to "Give information about X"
   * Only reformulate when necessary to make fragments searchable
 - If FOLLOW_UP: 
@@ -422,6 +430,10 @@ question: "BP ka full form"
 chat_history: ""
 question: "depression"
 -> {{"classification":"MEDICAL_QUESTION","reason":"single medical term - fragment","rewritten_query":"Give information about depression and cure if available","corrections":{{}}}}
+
+chat_history: ""
+question: "blood pressure"
+-> {{"classification":"MEDICAL_QUESTION","reason":"medical term/phrase - blood pressure is a medical measurement","rewritten_query":"Give information about blood pressure","corrections":{{}},"sample_answer":"Blood pressure is the force exerted by circulating blood against the walls of blood vessels. It is measured in millimeters of mercury (mmHg) and expressed as two values: systolic pressure (when the heart contracts) and diastolic pressure (when the heart relaxes). Normal blood pressure for adults is typically around 120/80 mmHg. High blood pressure (hypertension) can lead to serious health complications including heart disease, stroke, and kidney problems. Low blood pressure (hypotension) may cause dizziness, fainting, or shock. Blood pressure monitoring is essential during pregnancy as changes can indicate conditions like pre-eclampsia."}}
 
 chat_history: "Assistant: Would you like to know about postpartum hemorrhage?"
 question: "any treatment?"
@@ -607,7 +619,7 @@ Context Snippets:
 )
 
 answer_prompt = PromptTemplate(
-    input_variables=["sources","context","context_followup","query"],
+    input_variables=["sources","context","query"],
     template="""
 You are a professional medical assistant.
 
@@ -754,31 +766,6 @@ STEP 3 - REASONING-BASED ANSWER GENERATION:
 - STOP adding points once the query is fully answered
 
 
-STEP 4 - FOLLOW-UP QUESTION (CONDITIONAL - ONLY IF CLOSELY RELATED):
-- Follow-up questions should ONLY be provided if there is VERY CLOSE RESEMBLANCE between the answer topic and the follow-up context topic
-- CRITICAL RULE: Before generating a follow-up, analyze if the <context_followup> topic is an EXTENSION or CLOSELY RELATED aspect of the answer topic
-  * ✅ INCLUDE follow-up if: The follow-up context discusses the SAME medical condition/topic as your answer (e.g., answer about jaundice → follow-up about complications of jaundice, treatment of jaundice, prevention of jaundice)
-  * ❌ EXCLUDE follow-up if: The follow-up context discusses a DIFFERENT medical condition/topic (e.g., answer about jaundice → follow-up about blood pressure, diabetes, or any unrelated topic)
-- Format: "Would you like to know about <topic from context_followup>?" (without bullet points, at the end of answer)
-- Follow-up should be about a medical topic (not general/document titles like "Clinical Reference Manual for Advanced Neonatal Care in Ethiopia" ❌)
-- Follow-up should NOT overlap with information already in the answer
-- The follow-up must be STRICTLY from context_followup
-
-CRITICAL FOR FOLLOW-UP GENERATION:
-- FIRST: Identify the MAIN TOPIC of your answer (e.g., "jaundice", "pre-eclampsia", "newborn feeding")
-- SECOND: Read the ENTIRE context_followup content carefully
-- THIRD: Extract the MAIN MEDICAL TOPIC or KEY TERM from context_followup
-- FOURTH: Compare the topics - Are they the SAME medical condition/topic or closely related aspects?
-  * If YES (same topic, different aspect) → Generate follow-up question
-  * If NO (different topic entirely) → DO NOT generate follow-up question
-- Look for medical conditions, treatments, symptoms, complications, or procedures mentioned
-- Generate a question that will match relevant medical documents when searched
-- Use specific medical terminology that appears in medical documents
-- Avoid generic phrases - use precise medical terms (e.g., "treatment for jaundice" not "more information")
-- Ensure the question format matches how medical documents are indexed (e.g., "What are the complications of X?", "How to manage Y?", "What are the symptoms of Z?")
-- The question should be searchable and will retrieve relevant chunks from the document database
-- If context_followup contains multiple topics, pick the one that is MOST CLOSELY RELATED to your answer topic
-
 EXAMPLES:
 
 Example 1 - Simple Query (Direct Answer - Stop When Answered):
@@ -892,72 +879,7 @@ According to hydration_guide, emergency_care:
 
 ---
 
-Example 5 - Follow-up Question Generation (CLOSELY RELATED - INCLUDE):
-Query: "What causes jaundice?"
-Context:
-From [jaundice_guide.pdf]:
-Jaundice is caused by bilirubin buildup...
-
-Followup Context:
-From [complications_guide.pdf]:
-Complications of jaundice include liver damage, kernicterus in newborns, and chronic liver disease.
-
-Analysis: Answer topic = "jaundice", Follow-up topic = "complications of jaundice" → SAME topic (jaundice), different aspect (complications) → ✅ CLOSELY RELATED → INCLUDE follow-up
-Answer:
-According to jaundice_guide:
-• Jaundice is caused by bilirubin buildup in the blood
-• Common causes include liver diseases and hemolytic anemia
-• Newborn jaundice is common due to immature liver function
-
-Would you like to know about complications of jaundice?
-
-Note: The follow-up question extracted the main medical topic "complications of jaundice" from the followup_context, which is a specific, searchable medical term that will match documents. This is included because it's an extension of the same topic (jaundice).
-
----
-
-Example 5b - Follow-up Question Generation (DIFFERENT TOPIC - EXCLUDE):
-Query: "What causes jaundice?"
-Context:
-From [jaundice_guide.pdf]:
-Jaundice is caused by bilirubin buildup...
-
-Followup Context:
-From [blood_pressure_guide.pdf]:
-Blood pressure management involves monitoring systolic and diastolic readings. High blood pressure can lead to cardiovascular complications.
-
-Analysis: Answer topic = "jaundice", Follow-up topic = "blood pressure" → DIFFERENT topics entirely → ❌ NOT CLOSELY RELATED → EXCLUDE follow-up
-Answer:
-According to jaundice_guide:
-• Jaundice is caused by bilirubin buildup in the blood
-• Common causes include liver diseases and hemolytic anemia
-• Newborn jaundice is common due to immature liver function
-
-Note: No follow-up question is included because the follow-up context discusses "blood pressure", which is a completely different medical topic from "jaundice" (the answer topic). Follow-ups should only be provided when they are extensions or closely related aspects of the same topic.
-
----
-
-Example 5c - Follow-up Question Generation (SAME TOPIC, DIFFERENT ASPECT - INCLUDE):
-Query: "What are the symptoms of jaundice?"
-Context:
-From [symptom_guide.pdf]:
-Jaundice symptoms include yellowing of skin, yellowing of eyes, dark urine.
-
-Followup Context:
-From [treatment_guide.pdf]:
-Treatment of jaundice involves phototherapy for newborns, addressing underlying liver conditions, and in severe cases, exchange transfusion.
-
-Analysis: Answer topic = "jaundice" (symptoms), Follow-up topic = "treatment of jaundice" → SAME topic (jaundice), different aspect (treatment) → ✅ CLOSELY RELATED → INCLUDE follow-up
-Answer:
-According to symptom_guide:
-• Yellowing of skin and eyes (sclera) is the primary visible symptom
-• Dark urine indicates bile pigment changes
-• Pale stools may occur in some cases
-
-Would you like to know about treatment of jaundice?
-
----
-
-Example 6 - Critical Thinking: Importance/Significance Question (REASONING):
+Example 5 - Critical Thinking: Importance/Significance Question (REASONING):
 Query: "How crucial is golden minute?"
 Context:
 From [ENC-Immediate Care and Helping Babies Breathe at Birth provider guide]:
@@ -1214,24 +1136,8 @@ Before finalizing, ensure:
 - ✅ Logical grouping of related facts
 - ✅ Smooth flow between points
 - ✅ All information is from context only
-- ✅ Follow-up question doesn't overlap with answer
-- ✅ Follow-up question uses specific medical terminology that will match documents
 - ✅ Answer length appropriate for query (simple = 20-50 words, complex = 100-200 words)
 - ✅ Sources listed without file extensions
-
-FOLLOW-UP QUESTION EXAMPLES:
-
-GOOD (Will match documents):
-✅ "Would you like to know about jaundice treatment options?"
-✅ "Would you like to know about complications of postpartum hemorrhage?"
-✅ "Would you like to know about newborn feeding techniques?"
-✅ "Would you like to know about prevention of preeclampsia?"
-
-BAD (Won't match documents well):
-❌ "Would you like to know more about this topic?"
-❌ "Would you like to know about Clinical Reference Manual?"
-❌ "Would you like additional information?"
-❌ "Would you like to know about the document?"
 
 <user_query>
 {query}
@@ -1241,10 +1147,6 @@ IMPORTANT: If chunks in <context> seem partially relevant or borderline, still u
 {context}
 </context>
 
-<followup_context>
-{context_followup}
-</followup_context>
-
 INSTRUCTIONS:
 1. Read ALL chunks carefully and reason through them step-by-step
 2. Think logically: Can you reason a confident answer from the information provided?
@@ -1253,17 +1155,6 @@ INSTRUCTIONS:
 5. Assess confidence: Only answer if you can logically explain how chunks support your answer
 6. Synthesize information from multiple sources (use format: "According to A, B, C" when multiple sources contribute)
 7. Generate answer following all rules above - be confident if reasoning is clear, be honest if it fails
-8. CONDITIONAL: If <followup_context> is provided and non-empty, evaluate if follow-up should be included:
-   - FIRST: Identify the MAIN TOPIC of your answer (e.g., "jaundice", "pre-eclampsia", "newborn feeding")
-   - SECOND: Read the entire <followup_context> content
-   - THIRD: Extract the MAIN MEDICAL TOPIC or KEY TERM from <followup_context>
-   - FOURTH: Compare topics - Are they the SAME medical condition/topic or closely related aspects?
-     * ✅ INCLUDE follow-up if: Same topic, different aspect (e.g., answer about jaundice → follow-up about complications/treatment/prevention of jaundice)
-     * ❌ EXCLUDE follow-up if: Different topic entirely (e.g., answer about jaundice → follow-up about blood pressure, diabetes, or any unrelated topic)
-   - If INCLUDING: Generate "Would you like to know about [specific medical topic]?" (without bullet points, at the end of answer)
-   - Use precise medical terminology that will match document searches
-   - Example: "Would you like to know about jaundice treatment?" (not "Would you like more information?")
-   - The follow-up question should be the LAST line of your response (only if included)
 
 CRITICAL REASONING PRINCIPLES: 
 - Think step-by-step: What does each chunk tell you? How can you connect them to answer the query?
@@ -1274,8 +1165,6 @@ CRITICAL REASONING PRINCIPLES:
 - If chunks are completely unrelated → Exclude them
 - If you cannot reason a confident answer → Respond with: "I couldn't find sufficient information in the provided documents to answer this question accurately."
 - NEVER use external knowledge - only reason within provided chunks
-
-REMINDER: If <followup_context> is provided, evaluate if the follow-up topic is closely related to your answer topic. Only include a follow-up question if there is very close resemblance (same medical condition/topic, different aspect). If the follow-up context discusses a different medical topic entirely, DO NOT include a follow-up question.
 
 Write the final answer now.
 """
@@ -1624,13 +1513,12 @@ def hybrid_retrieve(query: str, top_k_vec: int = 10, u_cap: int = 7) -> List[Dic
     return candidates
 
 # -------------------- BERT FILTER + ANSWER --------------------
-def bert_filter_candidates(candidates: List[Dict[str, Any]], sample_answer: str, original_query: str, min_score: float = 0.35) -> Dict[str, List[Dict[str, Any]]]:
+def bert_filter_candidates(candidates: List[Dict[str, Any]], sample_answer: str, original_query: str, min_score: float = 0.35) -> List[Dict[str, Any]]:
     """
     Filter candidates using cross-encoder scores (BERT-based filtering):
     - Uses sample_answer for comparison if available (better semantic matching)
     - Falls back to original_query if sample_answer is empty
     - Top 4 candidates with score > min_score for answer
-    - Next best 2 candidates for followup
     
     Args:
         candidates: List of candidate chunks with 'scores' dict containing 'cross' score
@@ -1639,7 +1527,7 @@ def bert_filter_candidates(candidates: List[Dict[str, Any]], sample_answer: str,
         min_score: Minimum cross-encoder score threshold (default: 0.35)
     
     Returns:
-        Dict with 'answer_chunks' and 'followup_chunks'
+        List of filtered answer chunks (top 4)
     """
     print(f"[BERT_FILTER] Filtering {len(candidates)} candidates with min_score={min_score}")
     print(f"[BERT_FILTER] Using {'sample_answer' if sample_answer else 'original_query'} for comparison")
@@ -1866,38 +1754,16 @@ def bert_filter_candidates(candidates: List[Dict[str, Any]], sample_answer: str,
         # Sort all candidates by original cross score
         all_sorted = sorted(candidates, key=lambda x: x.get("scores", {}).get("cross", 0.0), reverse=True)
         answer_chunks = all_sorted[:2]
-        # For followup, take next best 2 from remaining
-        followup_chunks = all_sorted[2:4] if len(all_sorted) > 2 else []
         print(f"[BERT_FILTER] Fallback selected top 2 chunks with cross scores: {[c.get('scores', {}).get('cross', 0.0) for c in answer_chunks]}")
-        print(f"[BERT_FILTER] Fallback selected {len(followup_chunks)} followup chunks")
     else:
         # Take top 4 qualified for answer
         answer_chunks = qualified[:4]
-        
-        # Take next best 2 for followup
-        # First try remaining qualified chunks
-        remaining = qualified[4:] if len(qualified) > 4 else []
-        
-        # If we don't have 2 yet, take from unqualified but sorted candidates
-        if len(remaining) < 2:
-            unqualified = [c for c in candidates if c.get("scores", {}).get("answer_match", 0.0) <= min_score]
-            # Sort unqualified by answer_match score (descending), fallback to cross score
-            unqualified = sorted(unqualified, key=lambda x: (
-                x.get("scores", {}).get("answer_match", 0.0),
-                x.get("scores", {}).get("cross", 0.0)
-            ), reverse=True)
-            remaining = (remaining + unqualified)[:2]
-        
-        followup_chunks = remaining[:2]
     
     print(f"[BERT_FILTER] Qualified chunks (answer_match score > {min_score}): {len(qualified)}")
-    print(f"[BERT_FILTER] Selected {len(answer_chunks)} answer chunks, {len(followup_chunks)} followup chunks")
+    print(f"[BERT_FILTER] Selected {len(answer_chunks)} answer chunks")
     
     timer.mark("done")
-    return {
-        "answer_chunks": answer_chunks,
-        "followup_chunks": followup_chunks
-    }
+    return answer_chunks
 
 # Keep judge_sufficiency for backward compatibility (not used in new flow)
 def judge_sufficiency(query: str, candidates: List[Dict[str, Any]], judge_llm: ChatOpenAI | None = None, threshold_weak: float = 0.25) -> Dict[str, List[Dict[str, Any]]]:
@@ -2013,7 +1879,7 @@ def judge_sufficiency(query: str, candidates: List[Dict[str, Any]], judge_llm: C
     timer.mark("done")
     return {"answer_chunks": answer_chunks, "followup_chunks": followup_chunks}
 
-def synthesize_answer(query: str, top_candidates: List[Dict[str, Any]], context_followup: str, main_llm: ChatOpenAI | None = None) -> str:
+def synthesize_answer(query: str, top_candidates: List[Dict[str, Any]], main_llm: ChatOpenAI | None = None) -> str:
     global gemini_llm # Use Gemini for synthesis instead of OpenAI
 
     if main_llm is None: # Use Gemini LLM for synthesis
@@ -2031,7 +1897,6 @@ def synthesize_answer(query: str, top_candidates: List[Dict[str, Any]], context_
         src_expanded = expand_document_name(src) if src else "unknown"
         ctx_parts.append(f"From [{src_expanded}]:\\n{c['text']}")
     context = "\\n\\n".join(ctx_parts)
-    context_followup_str = context_followup # Renamed to avoid conflict with function parameter
     # Expand document abbreviations to full names for sources string
     sources_str = expand_sources_string(sources) if sources else "unknown"
     print(f"[synthesize_answer] Expanded sources: {sources_str}")
@@ -2039,7 +1904,6 @@ def synthesize_answer(query: str, top_candidates: List[Dict[str, Any]], context_
     prompt = answer_prompt.format(
         sources=sources_str,
         context=context,
-        context_followup=context_followup_str or "",
         query=query
     )
     print("[answer] sending synthesis prompt to GEMINI LLM (with improved multi-source consolidation)")
@@ -2049,7 +1913,7 @@ def synthesize_answer(query: str, top_candidates: List[Dict[str, Any]], context_
 
     return resp
 
-async def synthesize_answer_stream(query: str, top_candidates: List[Dict[str, Any]], context_followup: str, main_llm: ChatGoogleGenerativeAI | None = None):
+async def synthesize_answer_stream(query: str, top_candidates: List[Dict[str, Any]], main_llm: ChatGoogleGenerativeAI | None = None):
     """
     Streaming version of synthesize_answer that yields tokens as they arrive.
     Returns an async generator that yields token chunks.
@@ -2069,14 +1933,12 @@ async def synthesize_answer_stream(query: str, top_candidates: List[Dict[str, An
         src_expanded = expand_document_name(src) if src else "unknown"
         ctx_parts.append(f"From [{src_expanded}]:\\n{c['text']}")
     context = "\\n\\n".join(ctx_parts)
-    context_followup_str = context_followup
     sources_str = expand_sources_string(sources) if sources else "unknown"
     print(f"[synthesize_answer_stream] Expanded sources: {sources_str}")
 
     prompt = answer_prompt.format(
         sources=sources_str,
         context=context,
-        context_followup=context_followup_str or "",
         query=query
     )
     print("[answer_stream] sending synthesis prompt to GEMINI LLM (streaming mode)")
@@ -2354,8 +2216,16 @@ except ImportError as e:
     print(f"[VIDEO_SYSTEM] WARNING: video_embedding_cache module not found ({e}), using fallback mode")
 
 class VideoMatchingSystem:
-    def __init__(self, video_file_path: str = "./FILES/video_link_topic.xlsx", use_cache: bool = True):
+    def __init__(self, video_file_path: str = None, use_cache: bool = True):
         """Initialize the simplified video matching system using BERT similarity"""
+        # Resolve path: FILES/ is at project root, not in FASTAPI-DEPLOYMENT/
+        if video_file_path is None:
+            script_dir = Path(__file__).parent  # FASTAPI-DEPLOYMENT/
+            project_root = script_dir.parent    # RHL-FASTAPI/
+            video_file_path = str(project_root / "FILES" / "video_link_topic.xlsx")
+            # Fallback to relative path if absolute doesn't exist
+            if not Path(video_file_path).exists():
+                video_file_path = "./FILES/video_link_topic.xlsx"
         self.video_file_path = video_file_path
         self.topic_list = []  # List of topic strings
         self.url_list = []    # List of corresponding URLs
@@ -2485,8 +2355,16 @@ Response (YES/NO only):"""
 
 # -------------------- CACHE SYSTEM (RERANKER + LLM APPROACH) --------------------
 class CacheSystem:
-    def __init__(self, cache_file_path: str = "./FILES/cache_questions.xlsx"):
+    def __init__(self, cache_file_path: str = None):
         """Initialize the cache system using reranker (same logic as bert_filter_candidates) + LLM verification"""
+        # Resolve path: FILES/ is at project root, not in FASTAPI-DEPLOYMENT/
+        if cache_file_path is None:
+            script_dir = Path(__file__).parent  # FASTAPI-DEPLOYMENT/
+            project_root = script_dir.parent    # RHL-FASTAPI/
+            cache_file_path = str(project_root / "FILES" / "cache_questions.xlsx")
+            # Fallback to relative path if absolute doesn't exist
+            if not Path(cache_file_path).exists():
+                cache_file_path = "./FILES/cache_questions.xlsx"
         self.cache_file_path = cache_file_path
         self.question_list = []  # List of cached questions
         self.answer_list = []    # List of corresponding answers
@@ -2850,9 +2728,6 @@ Response: Return ONLY the reframed answer (with no cache mentions) if applicable
             print(f"[CACHE_SYSTEM] Falling back to RAG pipeline")
             return None
 
-# Global cache system
-cache_system: CacheSystem = None
-
 # -------------------- MAIN PIPELINE (called by API) --------------------
 async def medical_pipeline_api(user_id: str, user_message: str, background_tasks: BackgroundTasks) -> Dict[str, Any]:
     print(f"[pipeline] Start user_id={user_id}, message={user_message[:50]}")
@@ -2905,57 +2780,6 @@ async def medical_pipeline_api(user_id: str, user_message: str, background_tasks
 
     # Skip the old reformulation step since it's now combined above
 
-    # ---- CACHE CHECK (NEW: BERT + LLM APPROACH) ----
-    print("[pipeline] Step 3: Cache check using reranker (same logic as bert_filter_candidates)...")
-    cached_answer = None
-    if cache_system:
-        cache_start = time.perf_counter()
-        # Use sample_answer for comparison (same approach as bert_filter_candidates)
-        cached_answer = cache_system.check_cache(sample_answer, rewritten)
-        cache_end = time.perf_counter()
-        print(f"[pipeline] Cache check took {cache_end - cache_start:.3f} seconds")
-    
-    if cached_answer:
-        print("[pipeline] CACHE HIT! Skipping RAG pipeline...")
-        
-        # Apply correction prefix if needed
-        if label != "FOLLOW_UP" and correction:
-            correction_msg = f"I guess you meant: \"{rewritten}\""
-            cached_answer = correction_msg + "\n" + cached_answer
-        
-        # Find relevant video URL for cached answer
-        print("[pipeline] Step 4: Finding relevant video for cached answer...")
-        video_url = None
-        if video_system:
-            video_start = time.perf_counter()
-            video_url = video_system.find_relevant_video(cached_answer)
-            video_end = time.perf_counter()
-            print(f"[pipeline] Video matching took {video_end - video_start:.3f} secs")
-            if video_url:
-                print(f"[pipeline] Found relevant video: {video_url}")
-            else:
-                print("[pipeline] No relevant video found")
-        
-        # Schedule background save for cached answer
-        print("[pipeline] schedule background save: cached_answer")
-        background_tasks.add_task(_background_update_and_save, user_id, user_message, cached_answer, "answer", history_pairs, current_summary)
-        print("[pipeline] done with cached answer")
-        t_end = time.perf_counter()
-        total_time = t_end - start_time
-        timer.total("request")
-        print(f"total took {total_time:.2f} secs")
-        
-        # Return cached response with video URL
-        response = {"answer": cached_answer, "intent": "answer", "follow_up": None, "total_time": round(total_time, 3)}
-        if video_url:
-            response["video_url"] = video_url
-        else:
-            response["video_url"] = None
-        
-        return response
-    
-    print("[pipeline] CACHE MISS! Proceeding with RAG pipeline...")
-
     # ---- HYBRID RETRIEVAL ----
     print("[pipeline] Step 4: hybrid_retrieve")
     candidates = hybrid_retrieve(rewritten)   # vector + bm25 + rerank
@@ -2981,38 +2805,14 @@ async def medical_pipeline_api(user_id: str, user_message: str, background_tasks
     t5 = time.perf_counter()
     timer.mark("bert_filter_candidates")
     print(f"BERT filtering took {t5 - t4:.2f} secs")
-    print(f"[pipeline] BERT filter -> answers={len(filtered['answer_chunks'])} followups={len(filtered['followup_chunks'])}")
+    print(f"[pipeline] BERT filter -> answers={len(filtered)}")
 
     # ---- BERT FILTER → SYNTHESIZE ----
-    if filtered["answer_chunks"]:
-        top4 = filtered["answer_chunks"]
-        followup_candidates = filtered["followup_chunks"]
-
-        followup_q = ""
-        if followup_candidates: # Add this check
-            # Combine FULL TEXT of up to 2 followup candidates to give LLM enough context for topic extraction
-            followup_texts = []
-            for fc in followup_candidates[:2]:
-                # Get full text content - use text field (not just section, as section might be too short)
-                chunk_text = fc.get("text", "")
-                if chunk_text and len(chunk_text.strip()) > 0:
-                    # Use full text (up to 500 chars per chunk to avoid too long, but ensure we have enough)
-                    truncated_text = chunk_text[:500] if len(chunk_text) > 500 else chunk_text
-                    followup_texts.append(truncated_text)
-                    print(f"[pipeline] Followup chunk {len(followup_texts)}: {len(truncated_text)} chars, preview: {truncated_text[:100]}...")
-                else:
-                    print(f"[pipeline] WARNING: Followup candidate has empty text, skipping")
-            
-            # Combine followup contexts with clear separation
-            if followup_texts:
-                followup_q = "\n\n".join(followup_texts)
-                print(f"[pipeline] Followup context extracted: {len(followup_q)} chars from {len(followup_texts)} chunks")
-                print(f"[pipeline] Followup context preview: {followup_q[:200]}...")
-            else:
-                print("[pipeline] WARNING: No valid followup text extracted from candidates")
+    if filtered:
+        top4 = filtered
 
         print("[pipeline] Step 6: synthesize_answer")
-        answer = synthesize_answer(rewritten, top4, followup_q, gemini_llm)
+        answer = synthesize_answer(rewritten, top4, gemini_llm)
         t6 = time.perf_counter()
         timer.mark("synthesize_answer")
         print(f"synthesis took {t6 - t5:.2f} secs")
@@ -3045,7 +2845,7 @@ async def medical_pipeline_api(user_id: str, user_message: str, background_tasks
         print(f"total took {total_time:.2f} secs")
         
         # Return response with video URL
-        response = {"answer": answer, "intent": "answer", "follow_up": followup_q if followup_q else None, "total_time": round(total_time, 3)}
+        response = {"answer": answer, "intent": "answer", "total_time": round(total_time, 3)}
         if video_url:
             response["video_url"] = video_url
         else:
@@ -3125,36 +2925,6 @@ async def medical_pipeline_api_stream(user_id: str, user_message: str, backgroun
             yield "data: [DONE]\n\n"
             return
 
-        # Handle cache check
-        cache_answer = None
-        if cache_system:
-            print(f"[STREAM] Checking cache...")
-            cache_start = time.perf_counter()
-            cache_answer = cache_system.check_cache(sample_answer, rewritten)
-            cache_end = time.perf_counter()
-            print(f"[STREAM] Cache check took {cache_end - cache_start:.3f} secs")
-            
-            if cache_answer:
-                preprocessing_time = time.perf_counter() - start_time
-                print(f"[STREAM] CACHE HIT! Preprocessing completed in {preprocessing_time:.3f} secs")
-                print(f"[STREAM] Starting to stream cached answer NOW...")
-                
-                # Stream cached answer word by word
-                words = cache_answer.split()
-                for word in words:
-                    yield f"data: {json.dumps({'type': 'token', 'content': word + ' '})}\n\n"
-                    await asyncio.sleep(0.01)  # Small delay for smooth streaming
-                
-                # Get video URL for cached answer
-                video_url = None
-                if video_system:
-                    video_url = video_system.find_relevant_video(cache_answer)
-                
-                background_tasks.add_task(_background_update_and_save, user_id, user_message, cache_answer, "answer", history_pairs, current_summary)
-                yield f"data: {json.dumps({'type': 'metadata', 'intent': 'answer', 'follow_up': None, 'video_url': video_url, 'total_time': round(time.perf_counter() - start_time, 3)})}\n\n"
-                yield "data: [DONE]\n\n"
-                return
-
         # Hybrid retrieval
         print(f"[STREAM] Starting hybrid retrieval...")
         retrieval_start = time.perf_counter()
@@ -3184,9 +2954,9 @@ async def medical_pipeline_api_stream(user_id: str, user_message: str, backgroun
         filter_end = time.perf_counter()
         timer.mark("bert_filter_candidates")
         print(f"[STREAM] bert_filter_candidates took {filter_end - filter_start:.3f} secs")
-        print(f"[STREAM] Filtered to {len(filtered['answer_chunks'])} answer chunks, {len(filtered['followup_chunks'])} followup chunks")
+        print(f"[STREAM] Filtered to {len(filtered)} answer chunks")
 
-        if not filtered["answer_chunks"]:
+        if not filtered:
             msg = "I apologize, but I do not have sufficient information in my documents to answer this question accurately."
             # Stream no_context message word by word
             words = msg.split()
@@ -3199,20 +2969,8 @@ async def medical_pipeline_api_stream(user_id: str, user_message: str, backgroun
             yield "data: [DONE]\n\n"
             return
 
-        # Get top chunks and followup
-        top4 = filtered["answer_chunks"]
-        followup_candidates = filtered["followup_chunks"]
-        followup_q = ""
-        
-        if followup_candidates:
-            followup_texts = []
-            for fc in followup_candidates[:2]:
-                chunk_text = fc.get("text", "")
-                if chunk_text and len(chunk_text.strip()) > 0:
-                    truncated_text = chunk_text[:500] if len(chunk_text) > 500 else chunk_text
-                    followup_texts.append(truncated_text)
-            if followup_texts:
-                followup_q = "\n\n".join(followup_texts)
+        # Get top chunks
+        top4 = filtered
 
         # Apply correction prefix if needed (stream it first)
         if label != "FOLLOW_UP" and correction:
@@ -3229,7 +2987,7 @@ async def medical_pipeline_api_stream(user_id: str, user_message: str, backgroun
         token_count = 0
         
         full_answer = ""
-        async for token_chunk in synthesize_answer_stream(rewritten, top4, followup_q, gemini_llm):
+        async for token_chunk in synthesize_answer_stream(rewritten, top4, gemini_llm):
             if token_count == 0:
                 # Calculate time from request start to when first token is yielded to client
                 time_to_first_token = time.perf_counter() - start_time
@@ -3251,13 +3009,6 @@ async def medical_pipeline_api_stream(user_id: str, user_message: str, backgroun
         if video_system:
             video_url = video_system.find_relevant_video(full_answer)
 
-        # Extract follow-up question from full_answer if present
-        follow_up_question = None
-        if "Would you like to know about" in full_answer or "would you like to know about" in full_answer:
-            follow_match = re.search(r'[Ww]ould you like to know about ([^?]+)', full_answer)
-            if follow_match:
-                follow_up_question = follow_match.group(1).strip()
-
         # Schedule background save
         background_tasks.add_task(_background_update_and_save, user_id, user_message, full_answer, "answer", history_pairs, current_summary)
 
@@ -3268,7 +3019,7 @@ async def medical_pipeline_api_stream(user_id: str, user_message: str, backgroun
         timer.total("request")
         print(f"{'='*80}\n")
         
-        yield f"data: {json.dumps({'type': 'metadata', 'intent': 'answer', 'follow_up': follow_up_question, 'video_url': video_url, 'total_time': round(total_time, 3)})}\n\n"
+        yield f"data: {json.dumps({'type': 'metadata', 'intent': 'answer', 'video_url': video_url, 'total_time': round(total_time, 3)})}\n\n"
         yield "data: [DONE]\n\n"
 
     except Exception as e:
@@ -3283,7 +3034,7 @@ async def medical_pipeline_api_stream(user_id: str, user_message: str, backgroun
 # -------------------- API ENDPOINTS --------------------
 @app.on_event("startup")
 async def startup_event():
-    global embedding_model, reranker, chromadb_collection, llm, summarizer_llm, reformulate_llm, classifier_llm, gemini_llm, EMBED_DIM, video_system, cache_system
+    global embedding_model, reranker, chromadb_collection, llm, summarizer_llm, reformulate_llm, classifier_llm, gemini_llm, EMBED_DIM, video_system
     print("[startup] Initializing models and ChromaDB client...")
     t = CheckpointTimer("startup")
     embedding_model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
@@ -3302,9 +3053,20 @@ async def startup_event():
     if not CHROMADB_AVAILABLE:
         raise RuntimeError("ChromaDB not available. Install with: pip install chromadb")
     
-    VECTORSTORE_DIR = Path("FILES/local_vectorstore")
+    # Path resolution: script is in FASTAPI-DEPLOYMENT/, but FILES/ is at project root
+    # Go up one level from script location, then into FILES/local_vectorstore
+    script_dir = Path(__file__).parent  # FASTAPI-DEPLOYMENT/
+    project_root = script_dir.parent    # RHL-FASTAPI/
+    VECTORSTORE_DIR = project_root / "FILES" / "local_vectorstore"
+    
+    # Also try relative path (if running from project root)
+    if not VECTORSTORE_DIR.exists():
+        VECTORSTORE_DIR = Path("FILES/local_vectorstore")
+    
     if not VECTORSTORE_DIR.exists():
         print(f"[startup] WARNING: ChromaDB not found at {VECTORSTORE_DIR}")
+        print(f"[startup] Tried absolute path: {project_root / 'FILES' / 'local_vectorstore'}")
+        print(f"[startup] Tried relative path: FILES/local_vectorstore")
         print("[startup] Please run setup_local_vectorstore.py first to create the vector store")
         raise RuntimeError("ChromaDB vector store not found. Run setup_local_vectorstore.py first.")
     
@@ -3353,11 +3115,6 @@ async def startup_event():
     # Set temperature=0.0 for reproducible outputs
     gemini_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", api_key=GOOGLE_API_KEY, temperature=0.0)
     t.mark("init_llms")
-
-    # Initialize cache system
-    print("[startup] Initializing cache system...")
-    cache_system = CacheSystem()
-    t.mark("init_cache_system")
 
     # Initialize video matching system
     print("[startup] Initializing video matching system...")
