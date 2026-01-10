@@ -1,0 +1,3289 @@
+import os
+import json
+import time
+import asyncio
+import re
+from pathlib import Path
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, WebSocket, WebSocketDisconnect
+from fastapi.responses import StreamingResponse
+import aiosqlite
+from typing import List, Tuple, Dict, Any, Optional
+
+from sentence_transformers import SentenceTransformer, CrossEncoder
+try:
+    from flashrank import Ranker, RerankRequest
+    FLASHRANK_AVAILABLE = True
+except Exception:
+    Ranker = None
+    RerankRequest = None
+    FLASHRANK_AVAILABLE = False
+# ChromaDB for local vector store
+try:
+    import chromadb
+    from chromadb.config import Settings
+    CHROMADB_AVAILABLE = True
+except ImportError:
+    chromadb = None
+    Settings = None
+    CHROMADB_AVAILABLE = False
+    print("WARNING: chromadb not available. Install with: pip install chromadb")
+from langchain_core.prompts import PromptTemplate
+from langchain_core.messages import HumanMessage
+from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
+from typing import Optional
+import pandas as pd
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+
+
+# -------------------- CONFIG --------------------
+load_dotenv()
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+PINECONE_KEY = os.getenv("PINECONE_API_KEY_NEW")
+INDEX_NAME = os.getenv("PINECONE_INDEX", "medical-chatbot-index")
+CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+    raise RuntimeError("GOOGLE_API_KEY missing in environment")
+
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY missing in environment")
+# PINECONE_KEY no longer required - using local ChromaDB
+
+app = FastAPI()
+
+# Global variables for models and ChromaDB collection
+embedding_model: SentenceTransformer = None
+reranker: CrossEncoder = None
+chromadb_collection = None  # ChromaDB collection (replaces pinecone_index)
+llm: ChatOpenAI = None
+# chitchat_llm removed - now using Gemini for chitchat
+summarizer_llm: ChatOpenAI = None
+reformulate_llm: ChatOpenAI = None
+classifier_llm: ChatOpenAI = None
+gemini_llm: ChatGoogleGenerativeAI = None  # Gemini for ALL LLM tasks
+EMBED_DIM: int = None
+
+# -------------------- Pydantic Model for Request Body --------------------
+# class ChatMessage(BaseModel):
+#     user_id: str
+#     message: str
+#     last_suggested: str = "" # Optional field
+
+# -------------------- CHAT HISTORY MANAGEMENT --------------------
+MAX_VERBATIM_PAIRS = 3  # keep last 3 Q-A pairs verbatim
+
+
+# -------------------- TIMING / CHECKPOINT HELPERS --------------------
+class CheckpointTimer:
+    """Simple helper to log elapsed time between checkpoints."""
+    def __init__(self, name: str = "checkpoint"):
+        self.name = name
+        self.start = time.perf_counter()
+        self.last = self.start
+
+    def mark(self, label: str) -> float:
+        now = time.perf_counter()
+        elapsed = now - self.last
+        # print timing for this checkpoint
+        print(f"[{self.name}] {label} took {elapsed:.3f}s")
+        self.last = now
+        return elapsed
+
+    def total(self, label: str) -> float:
+        """Log total time since timer creation and return it."""
+        now = time.perf_counter()
+        total_elapsed = now - self.start
+        print(f"[{self.name}] TOTAL {label} took {total_elapsed:.3f}s")
+        self.last = now
+        return total_elapsed
+
+
+async def init_db():
+    async with aiosqlite.connect("chat_history.db") as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS chat_history (
+                id INTEGER PRIMARY KEY,
+                user_id TEXT,
+                question TEXT,
+                answer TEXT,
+                intent TEXT,
+                summary TEXT DEFAULT '',
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Check and add 'intent' column if it doesn't exist
+        cursor = await db.execute("PRAGMA table_info(chat_history)")
+        columns = [row[1] for row in await cursor.fetchall()]
+        
+        if 'intent' not in columns:
+            await db.execute("ALTER TABLE chat_history ADD COLUMN intent TEXT")
+            print("[DB] Added 'intent' column to chat_history table.")
+            
+        if 'summary' not in columns:
+            await db.execute("ALTER TABLE chat_history ADD COLUMN summary TEXT DEFAULT ''")
+            print("[DB] Added 'summary' column to chat_history table.")
+            
+        await db.commit()
+
+async def get_history(user_id: str) -> Tuple[List[Tuple[str, str, str]], str]:
+    async with aiosqlite.connect("chat_history.db") as db:
+        cursor = await db.execute("SELECT question, answer, intent, summary FROM chat_history WHERE user_id = ? ORDER BY timestamp ASC", (user_id,))
+        rows = await cursor.fetchall()
+        
+        history_pairs = []
+        last_summary = ""
+        for row_idx, row in enumerate(rows):
+            question = row[0] if len(row) > 0 else "unknown_question"
+            answer = row[1] if len(row) > 1 else "unknown_answer"
+            intent = row[2] if len(row) > 2 else "unknown_intent"
+            summary_val = row[3] if len(row) > 3 else ""
+            
+            history_pairs.append((question, answer, intent))
+            
+            # Update last_summary with the most recent non-empty summary
+            if summary_val:
+                last_summary = summary_val
+        
+        return history_pairs, last_summary
+
+async def save_history(user_id: str, question: str, answer: str, intent: str, summary: str = ''):
+    async with aiosqlite.connect("chat_history.db") as db:
+        await db.execute("INSERT INTO chat_history (user_id, question, answer, intent, summary) VALUES (?, ?, ?, ?, ?)", (user_id, question, answer, intent, summary))
+        await db.commit()
+
+def update_chat_history(user_id: str, current_history_pairs: List[Tuple[str, str, str]], current_summary: str, user_message: str, bot_reply: str, intent: str) -> Tuple[List[Tuple[str, str, str]], str]:
+    current_history_pairs.append((user_message, bot_reply, intent))
+    
+    # if we exceed MAX_VERBATIM_PAIRS, summarize older
+    if len(current_history_pairs) > MAX_VERBATIM_PAIRS:
+        # old entries to compress
+        old = current_history_pairs[:-MAX_VERBATIM_PAIRS]
+        text = "\n".join([f"User: {q} | Bot: {a}" for q, a, _ in old])
+        prompt = f"Summarize the following dialogues in one concise medical-context sentence so the bot can have context about the discussions happened so far(for future context):\n\n{text}"
+        try:
+            summary = summarizer_llm.invoke([HumanMessage(content=prompt)]).content.strip()
+        except Exception:
+            summary = ""
+        current_summary = (current_summary + " " + summary).strip()
+        current_history_pairs = current_history_pairs[-MAX_VERBATIM_PAIRS:]
+    
+    return current_history_pairs, current_summary
+
+def get_chat_context(history_pairs: List[Tuple[str, str, str]], summary: str) -> Tuple[str, str]:
+    """
+    Returns (full_chat_history, last_3_qa_pairs)
+    - full_chat_history: Full formatted history for LLM context
+    - last_3_qa_pairs: Last 3 non-chitchat Q&A pairs formatted for FOLLOW_UP reformulation
+                      Format: "User: <q1> | Bot: <a1>\nUser: <q2> | Bot: <a2>\nUser: <q3> | Bot: <a3>"
+                      This allows LLM to understand conversation context and link follow-ups to the MAIN topic
+                      Returns empty string if no non-chitchat pairs exist
+    """
+    # Filter out chitchat messages from verbatim history when constructing context for LLM
+    filtered_verbatim_pairs = [(q, a) for q, a, intent in history_pairs if intent != "chitchat"]
+    verbatim = "\n".join([f"User: {q} | Bot: {a}" for q, a in filtered_verbatim_pairs])
+    combined = (summary + "\n" + verbatim).strip()
+    
+    # Extract last 3 non-chitchat Q&A pairs explicitly for FOLLOW_UP reformulation
+    # This allows the LLM to understand conversation flow and link follow-ups to the MAIN topic
+    last_3_qa_pairs = ""
+    if filtered_verbatim_pairs:
+        # Take last 3 pairs (or fewer if not available)
+        recent_pairs = filtered_verbatim_pairs[-3:]
+        
+        # Format each pair, extracting follow-up offers from "no_context" responses
+        formatted_pairs = []
+        for q, a in recent_pairs:
+            # Extract follow-up offer from "no_context" responses if present
+            if "Would you like to know about" in a or "would you like to know about" in a:
+                followup_match = re.search(r'[Ww]ould you like to know about ([^?]+)', a)
+                if followup_match:
+                    # Format as "Assistant: Would you like to know about X?"
+                    formatted_answer = f"Assistant: Would you like to know about {followup_match.group(1)}?"
+                else:
+                    formatted_answer = f"Assistant: {a}"
+            else:
+                formatted_answer = f"Assistant: {a}"
+            
+            formatted_pairs.append(f"User: {q} | {formatted_answer}")
+        
+        last_3_qa_pairs = "\n".join(formatted_pairs)
+    
+    return combined, last_3_qa_pairs
+
+
+async def _background_update_and_save(user_id: str, user_message: str, bot_reply: str, intent: str, history_pairs: List[Tuple[str, str, str]], current_summary: str):
+    """Background worker: run the sync update_chat_history in a thread, then persist to DB."""
+    try:
+        updated_history_pairs, updated_summary = await asyncio.to_thread(
+            update_chat_history, user_id, history_pairs, current_summary, user_message, bot_reply, intent
+        )
+        # persist the final record (async)
+        await save_history(user_id, user_message, bot_reply, intent, updated_summary)
+        print("[_background_update_and_save] saved history in background")
+    except Exception as e:
+        print(f"[_background_update_and_save] failed: {e}")
+
+# -------------------- PROMPTS (improved, few-shot + edge cases) --------------------
+classifier_prompt = PromptTemplate(
+    input_variables=["chat_history", "question"],
+    template="""
+Return JSON only: {{"label":"MEDICAL_QUESTION|FOLLOW_UP|CHITCHAT,"reason":"short explanation"}}
+
+NOTE : You are a women's healthcare assistant classifier and users apart from medical questions related to disease or condition may ask questions about women's and newborn healthcare or nursing and thus questions related to new born treatment is also a medical question in this application.
+
+Guidance + few examples:
+- FOLLOW_UP: short answers to a previous assistant suggestion, e.g. assistant asked "Would you like to know about malaria prevention?" and user replies "yes" or "prevention please" -> FOLLOW_UP.
+- CHITCHAT: greetings, thanks, smalltalk, profanity, or explicit "stop" requests, ANYTHING WHICH IS NON-MEDICAL OR NON_FOLLOWUP -> CHITCHAT.
+- MEDICAL_QUESTION: any standalone question that asks for medical facts, diagnoses, treatments, or NEWBORN CARE or definitions.
+- MEDICAL_QUESTION : any medical word or phrase in the question, even if spellings is mis-spelled or mis-phrased to a medical content 
+
+Examples:
+
+
+chat_history: Assistant: Would you like to know about jaundice?
+question: clarify its types
+-> {{"label":"FOLLOW UP","reason":"asking for clarification about prvious answer"}}
+
+chat_history: Assistant: Would you like to know about jaundice?
+question: "clarify the dosoge and types of amilicin"
+-> {{"label":"MEDICAL_QUESTION","reason":"NEW QUESTION NOT RELATED TO PREVIOUS ASSISTANT SUGGESTION"}}
+
+chat_history: "Assistant: Would you like to know about jaundice?"
+question: "yes"
+-> {{"label":"FOLLOW_UP","reason":"affirmation to assistant suggestion"}}
+
+chat_history: "Assistant: Would you like to know about jaundice?"
+question: "no"
+-> {{"label":"CHITCHAT","reason":"user declining assistant suggestion"}}
+
+chat_history: ""
+question: "how to feed a newborn?"
+-> {{"label":"MEDICAL_QUESTION","reason":"aksing about care and treatment of newborn"}}
+
+
+
+chat_history: ""
+question: "hi, how are you?"
+-> {{"label":"CHITCHAT","reason":"greeting"}}
+
+
+chat_history: ""
+question: "when to bath my new born?"
+-> {{"label":"MEDICAL_QUESTION","reason":"aksing about care and treatment of newborn"}}
+
+chat_history: ""
+question: "what causes jaundice?"
+-> {{"label":"MEDICAL_QUESTION","reason":"standalone medical question"}}
+
+chat_history: ""
+question: "baby is not sucking mother's milk"
+-> {{"label":"MEDICAL_QUESTION","reason":"aksing about care and treatment of newborn"}}
+
+
+
+chat_history: ""
+question: "show me bitcoin price"
+-> {{"label":"CHITCHAT","reason":"non-medical topic"}}
+
+Now classify the following:
+chat_history:
+{chat_history}
+user_message:
+{question}
+"""
+)
+
+# Combined classification + reformulation prompt
+combined_classify_reformulate_prompt = PromptTemplate(
+    input_variables=["chat_history", "question"],
+    template="""
+Return JSON only: {{"classification":"MEDICAL_QUESTION|FOLLOW_UP|CHITCHAT","reason":"short explanation","rewritten_query":"optimized query","corrections":{{"misspelled":"corrected","abbrev":"expanded"}},"sample_answer":"brief sample answer in 100-150 words"}}
+
+You are a women's healthcare assistant that performs classification AND query reformulation in one step.
+
+IMPORTANT: For MEDICAL_QUESTION and FOLLOW_UP (not CHITCHAT), also generate a "sample_answer" field - a brief 350 word sample response that would answer the query and that would be present in medical documents. This should be in answer format (not question format), similar to how medical documents phrase information. Use declarative statements. For CHITCHAT, set sample_answer to empty string "".
+
+CLASSIFICATION RULES:
+- MEDICAL_QUESTION: any medical term, phrase, or question about medical facts, diagnoses, treatments, NEWBORN CARE, or women's health
+- MEDICAL_QUESTION: Medical terms/phrases (e.g., "blood pressure", "BP", "jaundice", "depression", "fever", "diabetes", "pre-eclampsia") should ALWAYS be MEDICAL_QUESTION, even if not phrased as a question
+- MEDICAL_QUESTION: Even if user asks multiple times about the same MEDICAL TOPIC, it should be considered as a MEDICAL_QUESTION
+- FOLLOW_UP: short responses to previous assistant suggestions (yes, sure, prevention please, etc.)
+- CHITCHAT: greetings, thanks, smalltalk, profanity, non-medical topics, or explicit "stop" requests OR ANYTHING WHICH IS NON-MEDICAL OR NON_FOLLOWUP
+
+CRITICAL MEDICAL TERM RECOGNITION:
+- If the query contains ANY medical terminology (blood pressure, BP, jaundice, fever, diabetes, pre-eclampsia, etc.), it MUST be classified as MEDICAL_QUESTION, not CHITCHAT
+- Medical terms can be single words ("jaundice"), abbreviations ("BP"), or phrases ("blood pressure", "pre-eclampsia")
+- Even if the query is just a medical term without question words, classify as MEDICAL_QUESTION
+- Examples: "blood pressure" → MEDICAL_QUESTION, "BP" → MEDICAL_QUESTION, "jaundice" → MEDICAL_QUESTION, "fever" → MEDICAL_QUESTION
+
+REFORMULATION RULES:
+- If CHITCHAT: return original message unchanged (no reformulation needed)
+- If MEDICAL_QUESTION: 
+  * If user query is a complete sentence/question (e.g., "what is CPAP", "how crucial is golden minute", "what is full form of BP") → Keep the query structure as-is, only correct spelling if needed
+  * If user query is just medical words/fragments or phrases (e.g., "jaundice", "depression", "BP", "blood pressure", "pre-eclampsia") → Reformulate to "Give information about [topic]" format
+  * Medical phrases like "blood pressure" should be treated the same as single medical terms
+  * Preserve user's intent and question format - don't change "what is X" to "Give information about X"
+  * Only reformulate when necessary to make fragments searchable
+- If FOLLOW_UP: 
+  * The chat_history provided contains the LAST 3 non-chitchat Q&A pairs (format: "User: <q1> | Bot: <a1>\nUser: <q2> | Bot: <a2>\nUser: <q3> | Bot: <a3>")
+  * Analyze the conversation flow to identify the MAIN topic being discussed
+  * The MAIN topic is typically the FIRST/ORIGINAL topic introduced in the conversation (e.g., "jaundice" in a conversation about jaundice, then cure, then prevention)
+  
+  * For DIRECT AFFIRMATIONS (yes, sure, okay, etc.):
+    - If the most recent Bot response contains "Would you like to know about [topic]?" → reformulate to "Provide details on [topic]"
+    - Use the most recent assistant suggestion directly
+  
+  * For ASPECT-BASED FOLLOW-UPS (prevention, cure, treatment, symptoms, causes, types, etc.):
+    - Identify the MAIN topic from the conversation history (the primary medical condition/topic being discussed)
+    - Link the aspect to the MAIN topic, NOT to intermediate responses
+    - Examples:
+      - Conversation: jaundice → cure of jaundice → user says "prevention" → reformulate to "prevention of jaundice" (NOT "prevention of cure of jaundice")
+      - Conversation: diabetes → treatment of diabetes → user says "symptoms" → reformulate to "symptoms of diabetes" (NOT "symptoms of treatment of diabetes")
+    - Common aspects: prevention, cure, treatment, symptoms, causes, types, diagnosis, complications, management
+  
+  * For SHORT QUESTIONS (what, how, when, why):
+    - If related to the MAIN topic, reformulate as "[question] about [MAIN topic]"
+    - Example: Conversation about jaundice, user says "how to treat?" → "How to treat jaundice?"
+  
+  * Always expand short follow-ups into full standalone questions that clearly specify the topic
+- Correct spelling errors when meaning changes (e.g., "johndice" -> "jaundice")
+- DO NOT expand medical abbreviations in rewritten_query - keep them as-is (e.g., "BP" stays "BP", not "Blood Pressure"; "CPAP" stays "CPAP")
+- Abbreviations will be handled by answer generation through reasoning within context chunks
+- Keep rewritten_query concise and medically precise
+
+CRITICAL FOR FOLLOW_UP: 
+- When chat_history contains multiple Q&A pairs, identify the MAIN topic from the conversation flow
+- Link aspect-based follow-ups (prevention, cure, treatment, etc.) to the MAIN topic, not intermediate responses
+- Only use the most recent response for direct affirmations ("yes", "sure") to specific offers
+
+EXAMPLES:
+
+chat_history: Assistant: Would you like to know about jaundice?
+question: clarify its types
+-> {{"classification":"FOLLOW_UP","reason":"asking for clarification about previous answer","rewritten_query":"What are the different types of jaundice?","corrections":{{}}}}
+
+chat_history: Assistant: Would you like to know about jaundice?
+question: "clarify the dosoge and types of amilicin"
+-> {{"classification":"MEDICAL_QUESTION","reason":"new question not related to previous suggestion","rewritten_query":"Give information about amoxicillin dosage and types","corrections":{{"dosoge":"dosage","amilicin":"amoxicillin"}}}}
+
+chat_history: "Assistant: Would you like to know about jaundice?"
+question: "yes"
+-> {{"classification":"FOLLOW_UP","reason":"affirmation to assistant suggestion","rewritten_query":"Provide details on jaundice","corrections":{{}}}}
+
+chat_history: "Assistant: Would you like to know about jaundice?"
+question: "no"
+-> {{"classification":"CHITCHAT","reason":"user declining assistant suggestion","rewritten_query":"no","corrections":{{}}}}
+
+chat_history: ""
+question: "how to feed a newborn?"
+-> {{"classification":"MEDICAL_QUESTION","reason":"asking about newborn care","rewritten_query":"Give information about newborn feeding and care","corrections":{{}},"sample_answer":"Newborn feeding involves several key considerations. Breastfeeding is recommended as the primary method, providing essential nutrients and antibodies. Newborns typically feed every 2-3 hours, with feeding sessions lasting 15-20 minutes per breast. Proper latch is crucial to ensure effective milk transfer and prevent nipple soreness. Signs of adequate feeding include regular weight gain, 6-8 wet diapers daily, and contentment after feeds. For formula feeding, use appropriate amounts based on age and follow sterilization guidelines. Burping after feeds helps prevent gas and discomfort."}}
+
+chat_history: ""
+question: "hi, how are you?"
+-> {{"classification":"CHITCHAT","reason":"greeting","rewritten_query":"hi, how are you?","corrections":{{}}}}
+
+chat_history: ""
+question: "when to bath my new born?"
+-> {{"classification":"MEDICAL_QUESTION","reason":"asking about newborn care","rewritten_query":"Give information about newborn bathing and care","corrections":{{"bath":"bathe"}}}}
+
+chat_history: ""
+question: "what causes jaundice?"
+-> {{"classification":"MEDICAL_QUESTION","reason":"standalone medical question - complete sentence","rewritten_query":"What causes jaundice?","corrections":{{}},"sample_answer":"Jaundice is caused by an excess of bilirubin in the blood. Common causes include liver diseases such as hepatitis, cirrhosis, or liver damage. Hemolytic anemia, where red blood cells break down rapidly, can also lead to jaundice. In newborns, physiological jaundice is common due to immature liver function. Blocked bile ducts from gallstones or tumors can prevent bile excretion, causing jaundice. Certain medications and genetic conditions like Gilbert syndrome may also contribute to elevated bilirubin levels."}}
+
+chat_history: ""
+question: "what is CPAP"
+-> {{"classification":"MEDICAL_QUESTION","reason":"complete question asking for definition","rewritten_query":"What is CPAP?","corrections":{{}}}}
+
+chat_history: ""
+question: "how crucial is golden minute"
+-> {{"classification":"MEDICAL_QUESTION","reason":"complete question asking about importance","rewritten_query":"How crucial is golden minute?","corrections":{{}}}}
+
+chat_history: ""
+question: "baby is not sucking mother's milk"
+-> {{"classification":"MEDICAL_QUESTION","reason":"complete sentence describing issue","rewritten_query":"Baby is not sucking mother's milk","corrections":{{}},"sample_answer":"Newborn feeding problems can arise from various causes. Latch issues are common and may result from improper positioning or tongue-tie. Weak sucking reflex can occur in premature infants or those with neurological conditions. Fatigue or jaundice may reduce feeding interest. Solutions include ensuring proper positioning, consulting lactation specialists, checking for oral abnormalities, and monitoring hydration. In some cases, supplemental feeding or pumping may be necessary. Persistent issues require medical evaluation to rule out underlying conditions affecting feeding ability."}}
+
+chat_history: ""
+question: "show me bitcoin price"
+-> {{"classification":"CHITCHAT","reason":"non-medical topic","rewritten_query":"show me bitcoin price","corrections":{{}}}}
+
+chat_history: ""
+question: "denger sign for johndice"
+-> {{"classification":"MEDICAL_QUESTION","reason":"medical question with misspellings","rewritten_query":"What are the danger signs for jaundice?","corrections":{{"denger":"danger","johndice":"jaundice"}}}}
+
+chat_history: ""
+question: "what is full form of BP"
+-> {{"classification":"MEDICAL_QUESTION","reason":"complete question asking for full form","rewritten_query":"What is the full form of BP?","corrections":{{}}}}
+
+chat_history: ""
+question: "what does CPAP stand for"
+-> {{"classification":"MEDICAL_QUESTION","reason":"complete question asking for full form","rewritten_query":"What does CPAP stand for?","corrections":{{}}}}
+
+chat_history: ""
+question: "BP ka full form"
+-> {{"classification":"MEDICAL_QUESTION","reason":"asking for full form in different language format","rewritten_query":"What is the full form of BP?","corrections":{{}}}}
+
+chat_history: ""
+question: "depression"
+-> {{"classification":"MEDICAL_QUESTION","reason":"single medical term - fragment","rewritten_query":"Give information about depression and cure if available","corrections":{{}}}}
+
+chat_history: ""
+question: "blood pressure"
+-> {{"classification":"MEDICAL_QUESTION","reason":"medical term/phrase - blood pressure is a medical measurement","rewritten_query":"Give information about blood pressure","corrections":{{}},"sample_answer":"Blood pressure is the force exerted by circulating blood against the walls of blood vessels. It is measured in millimeters of mercury (mmHg) and expressed as two values: systolic pressure (when the heart contracts) and diastolic pressure (when the heart relaxes). Normal blood pressure for adults is typically around 120/80 mmHg. High blood pressure (hypertension) can lead to serious health complications including heart disease, stroke, and kidney problems. Low blood pressure (hypotension) may cause dizziness, fainting, or shock. Blood pressure monitoring is essential during pregnancy as changes can indicate conditions like pre-eclampsia."}}
+
+chat_history: "Assistant: Would you like to know about postpartum hemorrhage?"
+question: "any treatment?"
+-> {{"classification":"FOLLOW_UP","reason":"follow-up about previous topic","rewritten_query":"What are treatments for postpartum hemorrhage?","corrections":{{}}}}
+
+chat_history: "<answer> would you like to know about newborn jaundice?"
+question: "yes"
+-> {{"classification":"FOLLOW_UP","reason":"affirmation to suggestion","rewritten_query":"Provide details on newborn jaundice","corrections":{{}}}}
+
+chat_history: "<answer> would you like to know about newborn jaundice?"
+question: "sure but also provide cure"
+-> {{"classification":"FOLLOW_UP","reason":"affirmation with additional request","rewritten_query":"Provide details on newborn jaundice and its cure","corrections":{{}}}}
+
+chat_history: "Assistant: Would you like to know about newborn feeding patterns?"
+question: "yes"
+-> {{"classification":"FOLLOW_UP","reason":"affirmation to most recent assistant suggestion about newborn feeding patterns","rewritten_query":"Provide details on newborn feeding patterns","corrections":{{}}}}
+
+NOTE: Even if the assistant's previous response was a "no context" message that included a follow-up offer like "Would you like to know about X?", the chat_history will contain "Assistant: Would you like to know about X?" and you should use THIS for FOLLOW_UP reformulation.
+
+EXAMPLES OF CONTEXT-AWARE REFORMULATION:
+
+chat_history: 
+User: jaundice | Assistant: [provides information about jaundice]
+User: cure | Assistant: [provides information about cure of jaundice]
+question: "prevention"
+-> {{"classification":"FOLLOW_UP","reason":"follow-up asking about prevention, linking to main topic jaundice","rewritten_query":"Give information about prevention of jaundice","corrections":{{}}}}
+
+chat_history: 
+User: diabetes | Assistant: [provides information about diabetes]
+User: treatment | Assistant: [provides information about treatment of diabetes]
+question: "symptoms"
+-> {{"classification":"FOLLOW_UP","reason":"follow-up asking about symptoms, linking to main topic diabetes","rewritten_query":"Give information about symptoms of diabetes","corrections":{{}}}}
+
+chat_history: 
+User: jaundice | Assistant: [provides information about jaundice]
+User: cure | Assistant: Would you like to know about complications of jaundice?
+question: "yes"
+-> {{"classification":"FOLLOW_UP","reason":"direct affirmation to most recent offer","rewritten_query":"Provide details on complications of jaundice","corrections":{{}}}}
+
+chat_history: 
+User: jaundice | Assistant: [provides information about jaundice]
+User: cure | Assistant: [no context response] Would you like to know about newborn feeding patterns?
+question: "yes"
+-> {{"classification":"FOLLOW_UP","reason":"direct affirmation to most recent offer about newborn feeding","rewritten_query":"Provide details on newborn feeding patterns","corrections":{{}}}}
+
+Now analyze and respond:
+chat_history:
+{chat_history}
+user_message:
+{question}
+"""
+)
+
+# REMOVED reformulate_prompt PromptTemplate
+
+chitchat_prompt = PromptTemplate(
+    input_variables=["conversation"],
+    template="""
+Instructions:
+
+
+
+
+
+Respond to the user’s input ({conversation}) with a friendly, professional, and empathetic tone, avoiding technical expertise.
+
+
+
+Maintain a conversational style, steering users toward maternal and newborn health-related medical questions without explicitly listing capabilities or limitations (e.g., avoid saying "I am not a doctor").
+
+CRITICAL RULE - NEVER ANSWER NON-MEDICAL QUESTIONS:
+- You MUST NOT provide factual answers to non-medical questions (geography, history, general knowledge, sports, weather, etc.)
+- You MUST NOT answer questions outside your domain (capital cities, current events, celebrities, etc.)
+- For ANY non-medical question, politely redirect ONLY: "I'm here to help with maternal and newborn questions, so please feel free to ask me anything related to that."
+- DO NOT provide any factual information for non-medical queries
+
+
+
+Unless distress is detected (e.g., suicidal intent), use a light, engaging tone to encourage medical queries.
+
+
+
+For distress signals, provide generic, politically correct advice and gently redirect to medical questions.
+
+
+
+Avoid self-referential comments about tone (e.g., "I am chirpy") and focus on the user’s input.
+
+
+
+If medical advice is requested, politely decline and redirect to medical questions without technical input.
+
+  Examples: 
+
+
+
+
+
+User: "How are you doing?"
+Bot: "I'm doing well, thank you! I'm here to help with maternal and newborn questions, so please feel free to ask me anything related to that."
+
+
+
+User: "Who is your favorite cricketer?"
+Bot: "I'm here to help with maternal and newborn questions, so please feel free to ask me anything related to that."
+
+
+
+User: "Hey bitch, how are you?"
+Bot: "Please let's keep this respectful. I'm here to help with maternal and newborn questions, so please feel free to ask me anything related to that."
+
+
+
+User: "I want to suicide."
+Bot: "I'm truly sorry to hear you're feeling this way. Please seek professional medical help immediately. I'm here to help with maternal and newborn questions, so please feel free to ask me anything related to that."
+
+
+
+User: "What is the temperature today in Pune?"
+Bot: "I'm here to help with maternal and newborn questions, so please feel free to ask me anything related to that."
+
+User: "What is the capital of France?"
+Bot: "I'm here to help with maternal and newborn questions, so please feel free to ask me anything related to that."
+CRITICAL: Never answer factual non-medical questions like geography, history, or general knowledge.
+
+
+
+User: "How do I treat a cold?"
+Bot: "I'm here to help with maternal and newborn questions, so please feel free to ask me anything related to that."
+
+
+
+User: "Tell me about pregnancy."
+Bot: "I'm here to help with maternal and newborn questions, so please feel free to ask me anything related to that."
+
+Edge Cases:
+
+
+
+
+
+User: "Goodbye."
+Bot: "Take care! I'm here whenever you'd like to discuss maternal and newborn health—feel free to return!"
+
+
+
+User: "You're useless!"
+Bot: "I'm sorry you feel that way. I'm designed to assist with maternal and newborn questions—perhaps there's something I can help with there?"
+
+
+
+User: "I feel so alone."
+Bot: "I'm sorry you're feeling that way. Please consider reaching out for support. I'm here to help with maternal and newborn questions, so please feel free to ask me anything related to that."
+
+Response Format:
+
+Provide a single, concise reply based on the above guidelines.
+
+Conversation: {conversation} Reply:"""
+)
+
+judge_prompt = PromptTemplate(
+    input_variables=["query","context_snippets"],
+    template="""
+Return JSON only: {{"judgments":[{{"index": <index of snippet>, "topic_match":"strong|medium|absolutely_not_possible","sufficient":true/false,"why":"short","alternative":"<anchored question or empty>"}}]}}
+
+Guidance:
+- strong: Large facts about the query can be found and more supporting facts about the topic so A strong answer can be formed about the query from the context.
+- weak: very limited info directly about the query but facts round about the topic  and thus a reasonable answer can be formed 
+- none: No where near the topic or the query for eg if topic is about cure of jaundice and context is about headache symptoms, then it is none
+
+sufficient is True when topic_match is strong or weak with some similarity to query or topic 
+Sufficient is False otherwise
+
+For each provided context snippet, make a judgment. The `index` in the output JSON should correspond to the order of the snippets in the input.
+
+Query:
+{query}
+
+Context Snippets:
+{context_snippets}
+"""
+)
+
+answer_prompt = PromptTemplate(
+    input_variables=["sources","context","query"],
+    template="""
+You are a professional medical assistant.
+
+TASK OVERVIEW:
+1. Read and reason through ALL context chunks carefully
+2. Think logically: Can you reason a confident answer from the information provided?
+3. Synthesize information using logical inference, not just keyword matching
+4. Generate a concise, well-structured answer ONLY if reasoning supports it
+
+CRITICAL RULES:
+- Always answer ONLY from <context> provided below - NEVER use external knowledge
+- Think step-by-step: What information is in chunks? How does it relate to the query?
+- Use logical reasoning to connect information across chunks
+- Be confident: If reasoning is clear, answer confidently
+- Be honest: If reasoning fails, say you don't know
+- Be PRECISE: Only answer what's asked, nothing extra
+- STOP when the question is answered - don't add extra information
+- MATCH ANSWER FORMAT TO QUERY COMPLEXITY:
+  * Simple queries ("what is X", "full form of X") → Direct, concise answer (1-2 sentences or 1 bullet point) - STOP immediately after answering
+  * Definition queries ("what is X") → Only the definition - STOP after providing definition
+  * Complex queries ("how crucial", "what are the causes", "explain in detail") → As many bullet points as needed to fully answer the query - STOP when query is fully answered
+  * NO MINIMUM bullet points - only include points that directly answer the query, then STOP
+  * If query asks for one thing (e.g., "full form of BP"), provide only that one thing and STOP
+- ANSWER LENGTH: Match to query - simple queries get concise answers, complex queries get detailed answers (typically 50-200 words)
+- Each bullet must be factual and context-bound
+- Summarize meaningfully in a perfect flow
+- Do NOT mention references to what's not-there in the context (e.g., "the document doesn't have much info about X" ❌)
+
+STEP 1 - REASONING & ANALYSIS (CRITICAL):
+- Read ALL chunks carefully and completely, even if they seem indirect
+- Think logically: Can you reason an answer to the query from this information?
+- WORK WITHIN CHUNK BOUNDARIES: Your knowledge base is ONLY the retrieved chunks - do NOT use external medical knowledge
+- UNDERSTAND QUERY NUANCES:
+  * "What is X?" → Definition only (what X is, not how/when/why)
+  * "Tell me about X" → Comprehensive overview within chunks
+  * "Explain X in detail" → Detailed explanation from all relevant chunk information
+  * "How does X work?" → Mechanism/process explanation from chunks
+  * "When is X used?" → Usage conditions/indications from chunks
+- For DERIVED INFORMATION (not directly stated):
+  * If chunks mention "A causes B" and "B causes C", you can reason "A indirectly relates to C" but also have to explicitly state how you derive this assumption
+  * If chunks mention symptoms X, Y, Z for condition A, and query asks "what are symptoms", synthesize all mentioned symptoms
+  * Use logical inference to connect dots, but ONLY from chunk information
+- For DETAIL REQUESTS ("in detail", "explain", "comprehensive"):
+  * Extract ALL relevant information from chunks (not just the first mention)
+  * Combine information from multiple chunks if they address different aspects
+  * Synthesize a comprehensive answer within chunk boundaries
+- For "what is X" / definition queries: Extract ONLY the definition/explanation of what X is - don't include usage, causes, treatment unless specifically asked
+- For importance/significance questions ("how crucial", "why important", "how important"):
+  * FIRST: Assess the impact/severity level from chunks (e.g., "crucial", "essential", "life-saving", "critical")
+  * THEN: Provide supporting facts/reasons that explain why it's crucial
+  * Structure: Start with impact assessment, then provide evidence
+- For relationship questions ("what is the relationship", "how are X and Y related"): Connect concepts mentioned in chunks - reason how they relate based on context
+- For full forms/definitions: Actively search for patterns:
+  * Explicit: "X stands for Y" or "X (Y)" or "X, also known as Y"
+  * Parenthetical: "Blood Pressure (BP)" or "BP (Blood Pressure)"
+  * Contextual: If chunk discusses "Blood Pressure" extensively and query asks "BP", reason the connection
+- For all queries: Use logical inference to connect information across chunks
+- Synthesize information: If chunk mentions multiple related points, combine them to answer the query
+- Think step-by-step: What does each chunk tell you? How can you connect them to answer the query?
+- For questions requiring synthesis: Don't just copy-paste - reason through the information and synthesize a coherent answer
+- BOUNDARY AWARENESS: If chunks don't contain sufficient information, acknowledge limitations - do NOT fabricate or infer from external knowledge
+
+STEP 2 - CONFIDENCE-BASED FILTERING:
+- If you can reason a confident answer from chunks → Use those chunks
+- If chunks contain related information but you can't confidently connect them → Don't use them
+- If chunks are completely unrelated → Exclude them
+- Confidence threshold: Only answer if you can logically explain how chunks support your answer
+- If you cannot reason confidently → Return: "I couldn't find sufficient information in the provided documents to answer this question accurately."
+
+STEP 1.5 - CRITICAL QUESTIONS SENSITIVITY (MEDICATIONS, PROCEDURES, DOSAGES):
+For questions about medications, procedures, dosages, or critical medical interventions:
+- MANDATORY: Explicitly state WHEN the medication/procedure is used (indications, conditions)
+- MANDATORY: Explicitly state DOSAGE information if mentioned in chunks (amount, route, frequency, duration)
+- MANDATORY: Explicitly state CONDITIONS/PRECAUTIONS if mentioned in chunks (contraindications, warnings, when NOT to use)
+- DO NOT provide generic information - ONLY use what's explicitly stated in chunks
+- If dosage/indication/precaution is NOT mentioned in chunks, do NOT include it (even if you know it externally)
+- Be PRECISE: Extract exact numerical values, units, timing, routes of administration as they appear in chunks
+- STRUCTURE for medication questions:
+  * First: What it is/used for (if asked)
+  * Then: Dosage (if mentioned): exact amount, route, frequency
+  * Then: Indications (when to use) - if mentioned
+  * Then: Precautions/contraindications (if mentioned)
+- STRUCTURE for procedure questions:
+  * When it's performed (indications)
+  * How it's done (if mentioned in chunks)
+  * Precautions/complications (if mentioned)
+- CRITICAL: Do NOT spit out random medication/procedure facts - only include what directly answers the query AND is present in chunks
+
+STEP 2 - MULTI-SOURCE CONSOLIDATION (CRITICAL):
+When multiple sources contain information about the same topic:
+
+DO (CORRECT):
+✅ "According to A.pdf, B.pdf, C.pdf:
+   • Point 1: [Combined information from all sources]
+   • Point 2: [Unique fact from A and B]
+   • Point 3: [Unique fact from C only]"
+
+DON'T (WRONG):
+❌ "According to A.pdf:
+   • Point 1: [facts from A]
+   According to B.pdf:
+   • Point 2: [facts from B]
+   According to C.pdf:
+   • Point 3: [facts from C]"
+
+CONSOLIDATION RULES:
+- Group sources that contribute to the same point: "According to A.pdf, B.pdf"
+- If sources provide unique information, combine them: "According to A.pdf, B.pdf, C.pdf"
+- Extract unique facts from each source and merge them logically
+- Avoid repetition: If A and B say the same thing, mention it once
+- Maintain flow: Related facts should be grouped together, not separated by source
+- Extract filename from metadata (DON'T mention extensions - abc✅, abc.pdf❌)
+
+STEP 3 - REASONING-BASED ANSWER GENERATION:
+- Begin with: **"According to <source(s)>"** (extract filename, NO extensions)
+  - Single source: "According to abc"
+  - Multiple sources: "According to abc, def, ghi"
+- Synthesize information using logical reasoning from chunks, not just keyword matching or copy-pasting
+- MATCH ANSWER FORMAT TO QUERY:
+  * Simple queries ("what is X", "full form of X"): Direct answer, 1-2 sentences or 1 bullet point
+  * Definition queries ("what is X"): Provide ONLY the definition - what X is, not how it's used or when
+  * Complex queries ("how crucial", "what are causes", "explain"): As many bullet points as needed to fully answer the query - STOP when query is answered
+  * NO MINIMUM bullet points - only include points that directly answer the query, then STOP
+- For "what is X" queries: Answer ONLY what X is (definition) - let user ask follow-ups for usage, causes, etc.
+- For importance/significance questions ("how crucial", "why important"):
+  * FIRST sentence/bullet: State the impact level (e.g., "The Golden Minute is crucial/essential/critical because...")
+  * THEN: Provide supporting facts/reasons that explain the importance
+  * Structure: Impact assessment first, then evidence
+- For relationship questions: Connect concepts and explain how they relate based on chunk information
+- For full forms: If chunks mention "Blood Pressure" and query asks "BP", reason: "BP stands for Blood Pressure"
+- For synthesis questions: Combine multiple points from chunks into a coherent answer that addresses the query
+- If you inferred (not explicitly stated): Use diplomatic language: "Based on the context, [answer]" or "The documents discuss..."
+- If explicitly stated: State it directly
+- BE PRECISE: Only answer what's asked, nothing extra
+- BE CONFIDENT: If reasoning is clear, state it confidently
+- BE HONEST: If reasoning fails, say you don't know
+- Use bullet points ONLY when query requires multiple points or detailed explanation
+- Include ONLY bullet points that directly answer the query - STOP when question is answered
+- If query asks for one thing (e.g., "full form of BP"), provide only that one thing in 1 bullet point or 1 sentence
+- NO MINIMUM bullet point requirement - answer exactly what's asked, nothing more
+- Each bullet should be a complete, meaningful point that synthesizes information
+- Combine related information from multiple sources into single bullets
+- Ensure logical flow: Related points should be adjacent
+- STOP adding points once the query is fully answered
+
+
+EXAMPLES:
+
+Example 1 - Simple Query (Direct Answer - Stop When Answered):
+Query: "what is full form of VAB"
+Context:
+From [Vacuum-Assisted Birth provider guide]:
+"VAB stands for Vacuum-Assisted Birth. A vacuum-assisted birth is a vaginal delivery where an obstetric vacuum device is used to assist the baby's birth."
+
+Reasoning: Query asks ONLY for full form. Chunk provides "VAB stands for Vacuum-Assisted Birth" - this answers the query completely. STOP here - don't add information about what vacuum-assisted birth is unless asked.
+Answer:
+According to Vacuum-Assisted Birth provider guide:
+• VAB stands for Vacuum-Assisted Birth
+
+---
+
+Example 1b - Definition Query (Only Definition - Stop When Answered):
+Query: "what is CPAP"
+Context:
+From [NICU manual]:
+"CPAP (Continuous Positive Airway Pressure) can be delivered using locally made devices, such as bubble CPAP, a Diamedica CPAP. The Diamedica CPAP is a concentrator device that generates its own oxygen and medical air."
+
+Reasoning: Query asks "what is CPAP" - definition query. Chunk provides definition: "CPAP (Continuous Positive Airway Pressure)". STOP after providing definition - don't add information about devices or delivery methods unless specifically asked.
+Answer:
+According to NICU manual:
+• CPAP stands for Continuous Positive Airway Pressure
+
+---
+
+Example 1c - Complex Query (Multiple Points):
+Query: "What causes fever?"
+Context:
+From [medical_guide.pdf]:
+Fever is caused by infections, inflammatory conditions, and certain medications.
+
+Answer:
+According to medical_guide:
+• Fever is primarily caused by infections such as bacterial or viral illnesses
+• Inflammatory conditions can trigger fever responses
+• Certain medications may induce fever as a side effect
+
+---
+
+Example 2 - Multi-Source Consolidation (CORRECT):
+Query: "What are the symptoms of jaundice?"
+Context:
+From [symptom_guide.pdf]:
+Jaundice symptoms include yellowing of skin, yellowing of eyes, dark urine.
+
+From [clinical_manual.pdf]:
+Jaundice presents with yellow skin discoloration, pale stools, and fatigue.
+
+From [treatment_guide.pdf]:
+Jaundice symptoms: yellowing, itchy skin, and abdominal pain.
+
+Answer:
+According to symptom_guide, clinical_manual, treatment_guide:
+• Yellowing of skin and eyes (sclera) is the primary visible symptom
+• Dark urine and pale stools indicate bile pigment changes
+• Fatigue and abdominal pain are common accompanying symptoms
+• Itchy skin (pruritus) may occur in some cases
+
+---
+Example 4 - Precise Answer Formatting:
+Query: "Oxytocin dosage"
+
+Expected answer : * The recommended dosage for postpartum hemorrhage management is 10 IU by IM/IV bolus injection, administered slowly over 1-2 minutes if IV access is available. ✅
+                  * For induction or augmentation of labor, oxytocin can be infused at a concentration of 2.5 units in 500 mL of dextrose or normal saline, starting at 2.5 mIU per minute and increasing by 2.5 mIU per minute every 30 minutes until a good contraction pattern is established. ✅
+
+Not Expected answer : * Oxytocin is an injectable uterotonic drug used to cause uterine contractions, assisting in the separation of the placenta and stopping postpartum bleeding.. ❌
+                     *  It is recommended for actively managing the third stage of labor and should be given within one minute of the birth of the last baby. ❌
+
+Example 3 - Multi-Source Consolidation (WRONG - DON'T DO THIS):
+Query: "What are the symptoms of jaundice?"
+Answer:
+According to symptom_guide:
+• Yellowing of skin
+• Yellowing of eyes
+• Dark urine
+According to clinical_manual:
+• Yellow skin discoloration
+• Pale stools
+• Fatigue
+According to treatment_guide:
+• Yellowing
+• Itchy skin
+• Abdominal pain
+
+❌ This is WRONG because:
+- Repetitive source citations break flow
+- Same information repeated multiple times
+- Poor readability and structure
+- Wastes word count
+
+---
+
+Example 4 - Partial Information from Multiple Sources:
+Query: "How to treat dehydration?"
+Context:
+From [hydration_guide.pdf]:
+Oral rehydration solutions are effective. Drink fluids regularly.
+
+From [emergency_care.pdf]:
+Severe dehydration requires IV fluids and medical supervision.
+
+Answer:
+According to hydration_guide, emergency_care:
+• Mild to moderate dehydration can be treated with oral rehydration solutions
+• Regular fluid intake is essential for recovery
+• Severe cases require IV fluids and immediate medical supervision
+• Medical monitoring is crucial for severe dehydration cases
+
+---
+
+Example 5 - Critical Thinking: Importance/Significance Question (REASONING):
+Query: "How crucial is golden minute?"
+Context:
+From [ENC-Immediate Care and Helping Babies Breathe at Birth provider guide]:
+"The 'Golden Minute' refers to the first minute after birth, during which a baby should be breathing well or require ventilation. Having at least one provider skilled in assisting a baby to breathe present at every birth is crucial. Immediate actions like stimulation to breathe and bag-mask ventilation within this first minute can be life-saving for babies who do not breathe spontaneously. Essential Newborn Care providers are trained to take immediate action to save the lives of babies who need assistance at birth."
+
+Reasoning: Query asks "how crucial" - FIRST assess impact level, THEN provide facts. Chunk states "crucial" and "life-saving" - these indicate high importance. Structure: Impact first, then supporting evidence.
+Answer:
+According to ENC-Immediate Care and Helping Babies Breathe at Birth provider guide:
+• The Golden Minute is crucial and life-saving - immediate actions within this first minute can save lives, especially for babies who do not breathe spontaneously
+• Having at least one provider skilled in assisting a baby to breathe present at every birth is essential
+• Actions like stimulation to breathe and bag-mask ventilation performed within this critical period can significantly impact the baby's survival
+• Essential Newborn Care providers are trained to take immediate action during this crucial time to save lives
+
+---
+
+Example 7 - Critical Thinking: Why/Reasoning Question (REASONING):
+Query: "Why is immediate newborn care important?"
+Context:
+From [newborn_care_manual.pdf]:
+"Newborns are vulnerable in the first minutes after birth. Delayed care can lead to complications. Immediate drying, warming, and assessment are essential. The first hour after birth is critical for establishing breathing and preventing hypothermia."
+
+Reasoning: Query asks "why" (reasoning). Chunk explains vulnerability, consequences of delay, and critical time period. Can synthesize the "why" from these points.
+Answer:
+According to newborn_care_manual:
+• Immediate newborn care is important because newborns are vulnerable in the first minutes after birth
+• Delayed care can lead to complications that may affect the baby's health
+• The first hour after birth is critical for establishing breathing and preventing hypothermia
+• Essential actions like drying, warming, and assessment must be performed immediately to ensure the baby's well-being
+
+---
+
+Example 8 - Critical Thinking: Synthesis from Multiple Points (REASONING):
+Query: "What makes a birth safe?"
+Context:
+From [safe_birth_guide.pdf]:
+"Skilled birth attendants are essential. Clean delivery environment prevents infections. Emergency equipment must be available. Proper monitoring during labor detects complications early. Postpartum care ensures mother and baby health."
+
+Reasoning: Query asks for synthesis of what makes birth safe. Chunk provides multiple factors. Can reason and synthesize these into a coherent answer about safety factors.
+Answer:
+According to safe_birth_guide:
+• A safe birth requires skilled birth attendants who can manage complications
+• Clean delivery environment is essential to prevent infections
+• Emergency equipment must be readily available for immediate intervention if needed
+• Proper monitoring during labor helps detect complications early
+• Postpartum care ensures continued health for both mother and baby
+
+---
+
+Example 9 - Full Form Query (Only What's Asked - Stop When Answered):
+Query: "what is full form of BP"
+Context:
+From [Pre-eclampsia and eclampsia provider guide]:
+"Blood Pressure (BP) measurements are important. Normal BP ranges from sBP 90-139 mmHg and dBP 60-89 mmHg. Elevated BP readings can be influenced by technique. BP often decreases through mid-pregnancy."
+
+Reasoning: Query asks ONLY for full form of BP. Chunk states "Blood Pressure (BP)" - this answers the query completely. STOP here - don't add information about normal ranges, measurement techniques, or pregnancy changes unless specifically asked.
+Answer:
+According to Pre-eclampsia and eclampsia provider guide:
+• BP stands for Blood Pressure
+
+---
+
+Example 10 - Full Form Cannot Reason (REASONING):
+Query: "what is full form of XYZ"
+Context:
+From [jaundice_guide.pdf]:
+"Jaundice symptoms include yellowing of skin, yellowing of eyes, dark urine. Jaundice is caused by bilirubin buildup."
+
+Reasoning: No connection between "XYZ" and "jaundice" - cannot reason an answer. Chunks are completely unrelated to query.
+Answer: "I couldn't find sufficient information in the provided documents to answer this question accurately."
+
+---
+
+Example 11 - Definition Through Reasoning (REASONING):
+Query: "what is jaundice"
+Context:
+From [medical_textbook.pdf]:
+"Jaundice presents as yellowing of skin and eyes due to bilirubin accumulation. It occurs when bilirubin levels exceed normal ranges. Jaundice can be physiological or pathological."
+
+Reasoning: Chunk provides definition and explanation of jaundice - can reason a clear answer
+Answer:
+According to medical_textbook:
+• Jaundice is a condition presenting as yellowing of skin and eyes
+• It is caused by bilirubin accumulation in the body
+• Jaundice occurs when bilirubin levels exceed normal ranges
+• It can be classified as physiological or pathological
+
+---
+
+Example 12 - Critical Thinking: Connecting Concepts (REASONING):
+Query: "What is the relationship between pre-eclampsia and magnesium sulfate?"
+Context:
+From [pre_eclampsia_guide.pdf]:
+"Pre-eclampsia is a serious condition during pregnancy. Magnesium sulfate is the drug of choice for preventing seizures in severe pre-eclampsia. It should be administered when blood pressure is elevated and proteinuria is present. The drug helps prevent life-threatening complications."
+
+Reasoning: Query asks about "relationship" (connection between concepts). Chunk explains how magnesium sulfate is used for pre-eclampsia (drug of choice, when to use, why). Can reason the relationship from this information.
+Answer:
+According to pre_eclampsia_guide:
+• Magnesium sulfate is the drug of choice for preventing seizures in severe pre-eclampsia
+• It should be administered when blood pressure is elevated and proteinuria is present in pre-eclampsia cases
+• The drug helps prevent life-threatening complications associated with pre-eclampsia
+• This treatment relationship is critical for managing this serious pregnancy condition
+
+---
+
+Example 13 - When Context Doesn't Answer Query (CRITICAL):
+
+❌ Query: "Is magnesium sulfate recommended for jaundice treatment?"
+Context mentions:
+- "Magnesium sulfate is used for pre-eclampsia prevention..."
+- "Jaundice treatment involves phototherapy..."
+
+Reasoning: Context mentions BOTH topics separately but doesn't connect them. Cannot reason a connection between magnesium sulfate and jaundice treatment.
+Answer: "I couldn't find sufficient information in the provided documents to answer this question accurately."
+
+❌ Query: "What causes fever?"
+Context: "Headache symptoms include pain, pressure, and sensitivity to light..."
+
+Reasoning: Context is about headache, not fever. Wrong topic entirely. Cannot reason an answer.
+Answer: "I couldn't find sufficient information in the provided documents to answer this question accurately."
+
+❌ Query: "How to treat dehydration?"
+Context: "Dehydration prevention involves drinking water regularly..."
+
+Reasoning: Context is about prevention, not treatment. Cannot reason treatment from prevention information.
+Answer: "I couldn't find sufficient information in the provided documents to answer this question accurately."
+
+❌ Query: "What are the symptoms of jaundice?"
+Context: "Magnesium sulfate dosing involves 4g IV loading dose..."
+
+Reasoning: Context is about magnesium sulfate dosing, not jaundice symptoms. Completely unrelated. Cannot reason an answer.
+Answer: "I couldn't find sufficient information in the provided documents to answer this question accurately."
+
+✅ Query: "What causes fever?"
+Context: "Fever is caused by infections, inflammatory conditions, and certain medications..."
+
+Reasoning: Context directly answers the question about fever causes. Can reason a clear answer.
+Answer: [Normal answer generation with facts about fever causes]
+
+✅ Query: "Is magnesium sulfate recommended for pre-eclampsia?"
+Context: "Magnesium sulfate is recommended for pre-eclampsia prevention..."
+
+Reasoning: Context directly connects magnesium sulfate to pre-eclampsia. Can reason a clear answer.
+Answer: [Normal answer generation]
+
+Example 14 - Critical Question: Medication Dosage (WITH METADATA):
+Query: "What is the dosage of oxytocin?"
+Context:
+From [Postpartum Hemorrhage guide]:
+"Oxytocin is recommended at 10 IU by IM/IV bolus injection for postpartum hemorrhage management. Administer slowly over 1-2 minutes if IV access is available. For labor induction, oxytocin is infused at 2.5 units in 500 mL of dextrose, starting at 2.5 mIU per minute."
+
+Reasoning: Query asks for dosage - must extract WHEN it's used (postpartum hemorrhage vs labor induction) and exact dosages from chunks.
+Answer:
+According to Postpartum Hemorrhage guide:
+• For postpartum hemorrhage management: 10 IU by intramuscular or intravenous bolus injection, administered slowly over 1-2 minutes if IV access is available
+• For labor induction: Oxytocin is infused at a concentration of 2.5 units in 500 mL of dextrose or normal saline, starting at 2.5 mIU per minute and increasing by 2.5 mIU per minute every 30 minutes until a good contraction pattern is established
+
+---
+
+Example 15 - Critical Question: Medication with Indications and Precautions:
+Query: "When should magnesium sulfate be used?"
+Context:
+From [Pre-eclampsia management guide]:
+"Magnesium sulfate is the drug of choice for preventing seizures in severe pre-eclampsia. It should be administered when blood pressure is elevated above 160/110 mmHg and proteinuria is present. Monitor for signs of magnesium toxicity: loss of deep tendon reflexes, respiratory depression. Do not use if urine output is less than 30 mL/hour."
+
+Reasoning: Query asks "when" - must extract indications (when to use), conditions (blood pressure, proteinuria), and precautions (when NOT to use).
+Answer:
+According to Pre-eclampsia management guide:
+• Magnesium sulfate should be used for preventing seizures in severe pre-eclampsia
+• Indications: Administer when blood pressure is elevated above 160/110 mmHg and proteinuria is present
+• Precautions: Do not use if urine output is less than 30 mL/hour due to risk of magnesium toxicity
+• Monitoring: Watch for signs of magnesium toxicity including loss of deep tendon reflexes and respiratory depression
+
+---
+
+Example 16 - Detail Request: "Explain in detail":
+Query: "Explain CPAP in detail"
+Context:
+From [NICU manual]:
+"CPAP (Continuous Positive Airway Pressure) can be delivered using locally made devices or bubble CPAP. The Diamedica CPAP is a concentrator device that generates its own oxygen. It contains two flowmeters, each capable of up to 10 L/min for oxygen and medical air. A humidifier ensures delivered air is warm and moist. CPAP is used for newborns with respiratory distress who can breathe spontaneously but need airway pressure support."
+
+Reasoning: Query asks "in detail" - must extract ALL aspects: what it is, how it works, devices, specifications, indications.
+Answer:
+According to NICU manual:
+• CPAP stands for Continuous Positive Airway Pressure, a respiratory support method for newborns
+• It can be delivered using locally made devices such as bubble CPAP, or specialized devices like the Diamedica CPAP
+• The Diamedica CPAP is a concentrator device that generates its own oxygen and medical air, not requiring separate oxygen and compressed air sources
+• It contains two flowmeters, each capable of delivering up to 10 L/min for oxygen and medical air
+• A humidifier ensures the delivered air and oxygen are warm and moist for patient comfort
+• Indication: CPAP is used for newborns with respiratory distress who can breathe spontaneously but need airway pressure support
+
+---
+
+Example 17 - Derived Information: Synthesizing from Multiple Chunks:
+Query: "What causes jaundice in newborns?"
+Context:
+From [Jaundice guide]:
+"Newborn jaundice occurs due to immature liver function. Physiological jaundice appears after 24 hours. Pathological jaundice appears before 24 hours."
+
+From [Bilirubin metabolism guide]:
+"Bilirubin is produced when red blood cells break down. The liver processes bilirubin. In newborns, the liver is not fully developed, so bilirubin accumulates."
+
+Reasoning: Query asks about causes. Chunks mention "immature liver function" and explain how bilirubin metabolism works in newborns. Can reason/synthesize: jaundice is caused by immature liver + increased bilirubin production, leading to accumulation.
+Answer:
+According to Jaundice guide, Bilirubin metabolism guide:
+• Newborn jaundice occurs due to immature liver function - the liver is not fully developed in newborns
+• Bilirubin is produced when red blood cells break down, and the liver normally processes it
+• Because the newborn liver cannot process bilirubin effectively, it accumulates in the body
+• This accumulation leads to jaundice, which can be physiological (appearing after 24 hours) or pathological (appearing before 24 hours)
+
+---
+
+Example 18 - Boundary Awareness: Information NOT in Chunks:
+Query: "What is the contraindication for using oxytocin in diabetes?"
+Context:
+From [Oxytocin dosing guide]:
+"Oxytocin is administered at 10 IU by IM/IV injection for postpartum hemorrhage. It should be given within one minute of birth."
+
+Reasoning: Query asks about contraindications for oxytocin in diabetes. Chunks only mention dosage and timing, NOT contraindications or diabetes. Cannot reason an answer from available chunks.
+Answer: "I couldn't find sufficient information in the provided documents to answer this question accurately."
+
+---
+
+CRITICAL REASONING RULE: 
+- Think step-by-step: What information is in chunks? How does it relate to the query?
+- Use logical inference to connect information, not just keyword matching
+- For critical questions (medications/procedures): Explicitly extract and state dosage, indications, precautions , when and when not to use only and only if mentioned
+- For detail requests: Extract ALL relevant information from chunks, synthesize comprehensively
+- For derived information: Reason connections between concepts, but ONLY from chunk content
+- If you can reasonably infer an answer from chunks, do so confidently
+- If you cannot reason a confident answer, respond with: "I couldn't find sufficient information in the provided documents to answer this question accurately."
+- Do NOT list unrelated facts just because topics are mentioned in the context
+- NEVER use external medical knowledge - ONLY work within chunk boundaries
+
+---
+
+ANSWER FORMAT AND LENGTH:
+- Match answer format to query complexity:
+  * Simple queries ("what is X", "full form of X"): 1-2 sentences or 1 bullet point (20-50 words) - STOP when question is answered
+  * Definition queries ("what is X"): Only definition - what X is (20-40 words) - STOP after definition
+  * Complex queries ("how crucial", "what are causes", "explain in detail"): As many bullet points as needed to answer the query (100-200 words) - STOP when query is fully answered
+- NO MINIMUM bullet point requirement - only include points that directly answer the query
+- If query asks for one thing, provide only that one thing - don't add extra information
+- Each bullet should be substantive, not trivial
+- Maintain professional medical expert level English
+- Ensure perfect flow of information (not random spitting)
+
+QUALITY CHECKS:
+Before finalizing, ensure:
+- ✅ Answer format matches query complexity (simple = concise, complex = detailed)
+- ✅ For "what is X" queries: Only definition provided, not usage/causes/treatment
+- ✅ For "how crucial" queries: Impact assessment first, then supporting facts
+- ✅ Multiple sources consolidated into single citation when appropriate
+- ✅ No repetition of same information
+- ✅ Logical grouping of related facts
+- ✅ Smooth flow between points
+- ✅ All information is from context only
+- ✅ Answer length appropriate for query (simple = 20-50 words, complex = 100-200 words)
+- ✅ Sources listed without file extensions
+
+<user_query>
+{query}
+</user_query>
+IMPORTANT: If chunks in <context> seem partially relevant or borderline, still use them - your role is to judge and extract useful information. Only exclude chunks that are completely unrelated to the query.
+<context>
+{context}
+</context>
+
+INSTRUCTIONS:
+1. Read ALL chunks carefully and reason through them step-by-step
+2. Think logically: Can you reason a confident answer from the information provided?
+3. For full forms: Search for explicit definitions ("X stands for Y", "X (Y)") or use contextual reasoning
+4. For all queries: Use logical inference to connect information across chunks
+5. Assess confidence: Only answer if you can logically explain how chunks support your answer
+6. Synthesize information from multiple sources (use format: "According to A, B, C" when multiple sources contribute)
+7. Generate answer following all rules above - be confident if reasoning is clear, be honest if it fails
+
+CRITICAL REASONING PRINCIPLES: 
+- Think step-by-step: What does each chunk tell you? How can you connect them to answer the query?
+- Use logical inference, not just keyword matching
+- For full forms: Look for explicit patterns OR reason from contextual usage
+- If you can reasonably infer an answer from chunks → Answer confidently
+- If chunks are related but you can't confidently connect them → Don't answer
+- If chunks are completely unrelated → Exclude them
+- If you cannot reason a confident answer → Respond with: "I couldn't find sufficient information in the provided documents to answer this question accurately."
+- NEVER use external knowledge - only reason within provided chunks
+
+Write the final answer now.
+"""
+)
+
+# -------------------- DOCUMENT ABBREVIATION MAPPING --------------------
+# Mapping from abbreviations to full document names (case-insensitive lookup)
+# All keys are normalized to lowercase for lookup
+DOCUMENT_ABBREVIATION_MAP = {
+    # BABC - Bleeding After Birth Provider Guide
+    "babc": "Bleeding After Birth Provider Guide",
+    "babc.pdf": "Bleeding After Birth Provider Guide",
+    "babg": "Bleeding After Birth Provider Guide",  # Alternative spelling
+    "babg.pdf": "Bleeding After Birth Provider Guide",
+    # ECLB - Essential Care for Labor and Birth Provider Guide
+    "eclb": "Essential Care for Labor and Birth Provider Guide",
+    "eclb.pdf": "Essential Care for Labor and Birth Provider Guide",
+    "enc": "Essential Newborn Care: Immediate Care and Helping Babies Breathe at Birth Provider Guide",
+    "enc.pdf": "Essential Newborn Care: Immediate Care and Helping Babies Breathe at Birth Provider Guide",
+    "enc 1": "Essential Newborn Care: Immediate Care and Helping Babies Breathe at Birth Provider Guide",
+    "enc1": "Essential Newborn Care: Immediate Care and Helping Babies Breathe at Birth Provider Guide",
+    "enc 1.pdf": "Essential Newborn Care: Immediate Care and Helping Babies Breathe at Birth Provider Guide",
+    "enc1.pdf": "Essential Newborn Care: Immediate Care and Helping Babies Breathe at Birth Provider Guide",
+    "enc 2": "Essential Newborn Care: Assessment and Continuing Care Provider Guide",
+    "enc2": "Essential Newborn Care: Assessment and Continuing Care Provider Guide",
+    "enc 2.pdf": "Essential Newborn Care: Assessment and Continuing Care Provider Guide",
+    "enc2.pdf": "Essential Newborn Care: Assessment and Continuing Care Provider Guide",
+    "pee": "Pre-eclampsia & Eclampsia Provider Guide",
+    "29_jan_morning": "WHO",
+    "pee.pdf": "Pre-eclampsia & Eclampsia Provider Guide",
+    "pee 1": "HMBS: Pre-Eclampsia & Eclampsia Medication Table",
+    "pee1": "HMBS: Pre-Eclampsia & Eclampsia Medication Table",
+    "pee 1.pdf": "HMBS: Pre-Eclampsia & Eclampsia Medication Table",
+    "pee1.pdf": "HMBS: Pre-Eclampsia & Eclampsia Medication Table",
+    "pee 2": "HMBS: MgSO4 Dosing and Monitoring Checklist",
+    "pee2": "HMBS: MgSO4 Dosing and Monitoring Checklist",
+    "pee 2.pdf": "HMBS: MgSO4 Dosing and Monitoring Checklist",
+    "pee2.pdf": "HMBS: MgSO4 Dosing and Monitoring Checklist",
+    "pol": "Prolonged & Obstructed Labor: Assessment Provider Guide",
+    "pol.pdf": "Prolonged & Obstructed Labor: Assessment Provider Guide",
+    "pol 1": "Prolonged & Obstructed Labor: Assessment Provider Guide",
+    "pol1": "Prolonged & Obstructed Labor: Assessment Provider Guide",
+    "pol 1.pdf": "Prolonged & Obstructed Labor: Assessment Provider Guide",
+    "pol1.pdf": "Prolonged & Obstructed Labor: Assessment Provider Guide",
+    "pol 2": "Prolonged & Obstructed Labor: Management Provider Guide",
+    "pol2": "Prolonged & Obstructed Labor: Management Provider Guide",
+    "pol 2.pdf": "Prolonged & Obstructed Labor: Management Provider Guide",
+    "pol2.pdf": "Prolonged & Obstructed Labor: Management Provider Guide",
+    "vab": "Vacuum Assisted Birth Provider Guide",
+    "vab.pdf": "Vacuum Assisted Birth Provider Guide",
+    "who_newborn_health": "Newborn Health Approved by WHO",
+    "who_newborn_health.pdf": "Newborn Health Approved by WHO",
+    "who_pregnancy_birth": "Managing Complications in Pregnancy and Childbirth by WHO",
+    "who_pregnancy_birth.pdf": "Managing Complications in Pregnancy and Childbirth by WHO",
+}
+
+def expand_document_name(abbrev: str) -> str:
+    """
+    Expand document abbreviation to full name.
+    Handles edge cases: case-insensitive, with/without spaces, with/without extensions, double extensions.
+    
+    Args:
+        abbrev: Document abbreviation (e.g., "pee", "PEE", "pee.pdf", "eclb.pdf.pdf", "enc 1")
+    
+    Returns:
+        Full document name if found, otherwise returns original abbrev
+    """
+    if not abbrev or abbrev == "unknown":
+        return abbrev
+    
+    # Normalize: lowercase, strip whitespace
+    normalized = abbrev.lower().strip()
+    
+    # Remove all .pdf extensions (handles "file.pdf.pdf" edge case)
+    while normalized.endswith('.pdf'):
+        normalized = normalized[:-4]
+    
+    # Remove any remaining file extensions just in case
+    if '.' in normalized:
+        normalized = normalized.rsplit('.', 1)[0]
+    
+    # Normalize spaces and underscores: "enc 1" -> "enc1", "enc  1" -> "enc1", "enc_1" -> "enc1"
+    normalized_no_spaces = normalized.replace(" ", "").replace("_", "")
+    
+    # Try exact match first (normalized key)
+    if normalized_no_spaces in DOCUMENT_ABBREVIATION_MAP:
+        return DOCUMENT_ABBREVIATION_MAP[normalized_no_spaces]
+    
+    # Also try with original spaces/underscores preserved (for keys like "who_newborn_health")
+    if normalized in DOCUMENT_ABBREVIATION_MAP:
+        return DOCUMENT_ABBREVIATION_MAP[normalized]
+    
+    # Handle numbered variants (e.g., "enc1", "enc 1", "pee2")
+    if len(normalized_no_spaces) >= 3 and normalized_no_spaces[-1].isdigit():
+        base = normalized_no_spaces[:-1]
+        number = normalized_no_spaces[-1]
+        
+        # Try various formats: "enc1", "enc 1", "enc_1"
+        variants = [
+            f"{base}{number}",      # "enc1"
+            f"{base} {number}",      # "enc 1" (with space)
+            f"{base}_{number}",      # "enc_1" (with underscore)
+        ]
+        
+        for variant in variants:
+            if variant in DOCUMENT_ABBREVIATION_MAP:
+                return DOCUMENT_ABBREVIATION_MAP[variant]
+        
+        # Also try base name without number (for generic "enc" when "enc1" not found)
+        if base in DOCUMENT_ABBREVIATION_MAP:
+            return DOCUMENT_ABBREVIATION_MAP[base]
+    
+    # Try normalized_no_spaces variants for numbered cases too
+    if len(normalized) >= 3 and normalized[-1].isdigit():
+        base = normalized[:-1]
+        number = normalized[-1]
+        variants = [
+            f"{base}{number}",
+            f"{base} {number}",
+            f"{base}_{number}",
+        ]
+        for variant in variants:
+            if variant in DOCUMENT_ABBREVIATION_MAP:
+                return DOCUMENT_ABBREVIATION_MAP[variant]
+        if base in DOCUMENT_ABBREVIATION_MAP:
+            return DOCUMENT_ABBREVIATION_MAP[base]
+    
+    # Fallback: return original (might be a new document not in mapping)
+    return abbrev
+
+def expand_sources_string(sources_list: List[str]) -> str:
+    """
+    Expand all document abbreviations in sources list to full names.
+    Handles edge cases: multiple extensions, case variations, spaces.
+    
+    Args:
+        sources_list: List of source abbreviations (e.g., ["pee.pdf", "eclb.pdf.pdf", "enc 1"])
+    
+    Returns:
+        String with full names joined by " and " (e.g., "Pre-eclampsia & Eclampsia Provider Guide and Essential Care for Labor and Birth Provider Guide")
+    """
+    if not sources_list:
+        return "unknown"
+    
+    expanded = []
+    for src in sources_list:
+        if not src or src == "unknown":
+            expanded.append("unknown")
+            continue
+        
+        # expand_document_name handles all normalization internally (extensions, case, spaces)
+        # Pass the full source name - function handles .pdf removal
+        full_name = expand_document_name(src)
+        expanded.append(full_name)
+        print(f"[expand_sources] '{src}' -> '{full_name}'")
+    
+    result = " and ".join(expanded)
+    return result
+
+# -------------------- HELPERS --------------------
+def safe_json_parse(text):
+    try:
+        obj = json.loads(text[text.find("{"):text.rfind("}")+1])
+        return obj
+    except Exception:
+        return None
+
+# -------------------- HYBRID RETRIEVAL (vector -> bm25 -> cross -> fusion) --------------------
+def hybrid_retrieve(query: str, top_k_vec: int = 10, u_cap: int = 7) -> List[Dict[str, Any]]:
+    """
+    Returns re-ranked candidate chunks using vector + BM25 + cross-encoder.
+    """
+    print("="*60)
+    print("HYBRID RETRIEVAL BLOCK BREAKDOWN")
+    print("="*60)
+    print(f"[HYBRID] Query: {query[:50]}...")
+    print(f"[HYBRID] top_k_vec={top_k_vec}, u_cap={u_cap}")
+    
+    timer = CheckpointTimer("hybrid_retrieve")
+    
+    # 1) Vector search - EMBEDDING ENCODING
+    print("[HYBRID] Step 1: Encoding query with embedding model...")
+    q_emb = embedding_model.encode(query, convert_to_numpy=True).tolist()
+    timer.mark("embedding.encode")
+    print(f"[HYBRID] embedding.encode took {timer.last - timer.start:.3f}s")
+    
+    # 2) CHROMADB VECTOR SEARCH
+    print("[HYBRID] Step 2: Querying ChromaDB vector database...")
+    if chromadb_collection is None:
+        raise RuntimeError("ChromaDB collection not initialized. Run setup_local_vectorstore.py first.")
+    
+    # Check collection has data
+    collection_count = chromadb_collection.count()
+    if collection_count == 0:
+        print(f"[HYBRID] WARNING: ChromaDB collection is empty ({collection_count} chunks)")
+        print("[HYBRID] Returning empty results - run setup_local_vectorstore.py to populate the collection")
+        timer.mark("chromadb.query")
+        print(f"[HYBRID] chromadb.query took {timer.last - timer.start:.3f}s")
+        matches = []
+        print(f"[HYBRID] Retrieved {len(matches)} matches from ChromaDB")
+    else:
+        print(f"[HYBRID] Querying ChromaDB collection with {collection_count} chunks...")
+        try:
+            # ChromaDB query with error handling
+            results = chromadb_collection.query(
+                query_embeddings=[q_emb],
+                n_results=min(top_k_vec, collection_count),  # Don't request more than available
+                include=["metadatas", "documents", "distances"]
+            )
+            timer.mark("chromadb.query")
+            print(f"[HYBRID] chromadb.query took {timer.last - timer.start:.3f}s")
+            
+            # Process results (ChromaDB returns lists of lists)
+            matches = []
+            if results and "ids" in results and results["ids"] and len(results["ids"]) > 0:
+                num_results = len(results["ids"][0])
+                for i in range(num_results):
+                    try:
+                        match_id = results["ids"][0][i]
+                        metadata = results["metadatas"][0][i] if (results.get("metadatas") and len(results["metadatas"]) > 0) else {}
+                        document = results["documents"][0][i] if (results.get("documents") and len(results["documents"]) > 0) else ""
+                        distance = results["distances"][0][i] if (results.get("distances") and len(results["distances"]) > 0) else 1.0
+                        
+                        # Convert distance to similarity score (ChromaDB uses distance, lower is better)
+                        # For cosine similarity: distance = 1 - cosine_similarity
+                        # So: similarity = 1 - distance (for cosine space)
+                        # Cosine distance range: 0 (identical) to 2 (opposite)
+                        # Convert to similarity: similarity = 1 - (distance / 2)
+                        if distance is not None:
+                            # For cosine, ChromaDB returns 1 - cosine_similarity as distance
+                            # So similarity = 1 - distance
+                            similarity = max(0.0, 1.0 - float(distance)) if distance <= 2.0 else 0.0
+                        else:
+                            similarity = 0.0
+                        
+                        matches.append({
+                            "id": match_id,
+                            "metadata": metadata if isinstance(metadata, dict) else {},
+                            "document": document if document else "",
+                            "score": similarity
+                        })
+                    except Exception as e:
+                        print(f"[HYBRID] WARNING: Error processing match {i}: {e}")
+                        continue
+            else:
+                print(f"[HYBRID] WARNING: No results returned from ChromaDB query")
+                matches = []
+            
+            print(f"[HYBRID] Retrieved {len(matches)} matches from ChromaDB")
+        except Exception as e:
+            print(f"[HYBRID] ERROR: ChromaDB query failed: {e}")
+            timer.mark("chromadb.query")
+            print(f"[HYBRID] chromadb.query took {timer.last - timer.start:.3f}s (failed)")
+            raise RuntimeError(f"ChromaDB query failed: {e}") from e
+
+    # 3) PROCESS MATCHES
+    print("[HYBRID] Step 3: Processing matches and deduplicating...")
+    vec_matches = []
+    for m in matches:
+        try:
+            # Get text from metadata first, then fallback to document
+            text = m["metadata"].get("text_full") or m["metadata"].get("text_snippet") or m.get("document", "")
+            if not text:
+                print(f"[HYBRID] WARNING: Match {m['id']} has no text content, skipping")
+                continue
+            
+            vec_matches.append({
+                "id": m["id"],
+                "text": text,
+                "meta": m["metadata"]
+            })
+        except Exception as e:
+            print(f"[HYBRID] WARNING: Error processing match {m.get('id', 'unknown')}: {e}")
+            continue
+    
+    timer.mark("process_matches")
+    print(f"[HYBRID] process_matches took {timer.last - timer.start:.3f}s")
+
+    # 4) COMBINE & CAP
+    if not vec_matches:
+        print(f"[HYBRID] WARNING: No valid matches after processing")
+        candidates = []
+    else:
+        candidates = {m["id"]: m for m in (vec_matches)}  # deduplicate
+        candidates = list(candidates.values())[:u_cap]
+    timer.mark("deduplicate_cap")
+    print(f"[HYBRID] deduplicate_cap took {timer.last - timer.start:.3f}s")
+    print(f"[HYBRID] Final candidates: {len(candidates)}")
+
+    # 5) RE-RANKING
+    print("[HYBRID] Step 4: Re-ranking candidates...")
+    if not candidates:
+        print(f"[HYBRID] WARNING: No candidates to re-rank, returning empty list")
+        return []
+    
+    # Process re-ranking (we know candidates exist here)
+    # If FlashRank Ranker is available, it exposes a `rerank` method
+    if hasattr(reranker, "rerank"):
+        print("[HYBRID] Using FlashRank reranker...")
+        passages = [{"id": c["id"], "text": c["text"], "meta": c["meta"]} for c in candidates]
+        request = RerankRequest(query=query, passages=passages)
+        try:
+            ranked = reranker.rerank(request)
+            # PRINT quick debug for demo
+            print("[FLASHRANK_RANKED]:", [r.get("id") for r in ranked])
+            for c in candidates:
+                matching = next((r for r in ranked if r.get("id") == c.get("id")), None)
+                if matching:
+                    c["scores"] = {"cross": float(matching.get("relevance_score", 0.0))}
+                else:
+                    c["scores"] = {"cross": 0.0}
+        except Exception as e:
+            print(f"[hybrid_retrieve] FlashRank rerank failed: {e}")
+            # fallback: set neutral scores so later steps can handle
+            for c in candidates:
+                c["scores"] = {"cross": 0.0}
+        timer.mark("flashrank.rerank")
+        print(f"[HYBRID] flashrank.rerank took {timer.last - timer.start:.3f}s")
+    else:
+        # Fallback: existing CrossEncoder.predict path
+        print("[HYBRID] Using CrossEncoder reranker...")
+        pairs = [(query, c["text"]) for c in candidates]
+        try:
+            scores = reranker.predict(pairs)
+            for i, c in enumerate(candidates):
+                c["scores"] = {"cross": float(scores[i])}
+        except Exception as e:
+            print(f"[hybrid_retrieve] CrossEncoder predict failed: {e}")
+            for c in candidates:
+                c["scores"] = {"cross": 0.0}
+        timer.mark("cross-encoder.predict")
+        print(f"[HYBRID] cross-encoder.predict took {timer.last - timer.start:.3f}s")
+
+    # 6) SORT CANDIDATES
+    print("[HYBRID] Step 5: Sorting candidates by relevance score...")
+    candidates = sorted(candidates, key=lambda x: x.get("scores", {}).get("cross", 0.0), reverse=True)
+    timer.mark("sort_candidates")
+    print(f"[HYBRID] sort_candidates took {timer.last - timer.start:.3f}s")
+    
+    # FINAL SUMMARY
+    total_time = timer.total("hybrid_retrieve")
+    print(f"[HYBRID] TOTAL HYBRID RETRIEVAL TIME: {total_time:.3f}s")
+    print(f"[HYBRID] Returning {len(candidates)} ranked candidates")
+    print("="*60)
+    
+    return candidates
+
+# -------------------- BERT FILTER + ANSWER --------------------
+def bert_filter_candidates(candidates: List[Dict[str, Any]], sample_answer: str, original_query: str, min_score: float = 0.35) -> List[Dict[str, Any]]:
+    """
+    Filter candidates using cross-encoder scores (BERT-based filtering):
+    - Uses sample_answer for comparison if available (better semantic matching)
+    - Falls back to original_query if sample_answer is empty
+    - Top 4 candidates with score > min_score for answer
+    
+    Args:
+        candidates: List of candidate chunks with 'scores' dict containing 'cross' score
+        sample_answer: Sample answer text from reformulation LLM (for better semantic matching)
+        original_query: Original query (fallback if sample_answer is empty)
+        min_score: Minimum cross-encoder score threshold (default: 0.35)
+    
+    Returns:
+        List of filtered answer chunks (top 4)
+    """
+    print(f"[BERT_FILTER] Filtering {len(candidates)} candidates with min_score={min_score}")
+    print(f"[BERT_FILTER] Using {'sample_answer' if sample_answer else 'original_query'} for comparison")
+    timer = CheckpointTimer("bert_filter_candidates")
+    
+    # Use sample_answer for comparison if available, otherwise fall back to original_query
+    comparison_text = sample_answer if sample_answer else original_query
+    
+    # Re-score candidates against sample_answer using cross-encoder
+    global reranker
+    print(f"[BERT_FILTER] Re-scoring candidates against comparison text ({len(comparison_text)} chars)...")
+    print(f"[BERT_FILTER] Comparison text preview: {comparison_text[:200]}...")
+    print(f"[BERT_FILTER] Reranker type: {type(reranker).__name__}")
+    print(f"[BERT_FILTER] Reranker has 'predict': {hasattr(reranker, 'predict')}")
+    print(f"[BERT_FILTER] Reranker has 'rerank': {hasattr(reranker, 'rerank')}")
+    print(f"[BERT_FILTER] FLASHRANK_AVAILABLE: {FLASHRANK_AVAILABLE}")
+    
+    # Debug: Check candidate texts
+    print(f"[BERT_FILTER] Checking first candidate text length: {len(candidates[0].get('text', '')) if candidates else 0}")
+    if candidates:
+        print(f"[BERT_FILTER] First candidate text preview: {candidates[0].get('text', '')[:100]}...")
+        print(f"[BERT_FILTER] First candidate original cross score: {candidates[0].get('scores', {}).get('cross', 0.0)}")
+    
+    # Batch re-scoring for efficiency
+    # IMPORTANT: Check which reranker is actually being used
+    # FlashRank (Ranker) has 'rerank' method
+    # CrossEncoder has 'predict' method
+    try:
+        # Priority: Check FlashRank first if available, then CrossEncoder
+        if hasattr(reranker, "rerank") and FLASHRANK_AVAILABLE:
+            # FlashRank path - batch rerank
+            # NOTE: FlashRank might not work well with very long queries (sample_answer)
+            # Consider truncating sample_answer or using rewritten query for FlashRank
+            print("[BERT_FILTER] Using FlashRank.rerank path")
+            
+            # For FlashRank, use original_query if sample_answer is too long (FlashRank optimized for queries, not long answers)
+            flashrank_query = original_query if len(comparison_text) > 200 else comparison_text
+            print(f"[BERT_FILTER] Using {'original_query' if len(comparison_text) > 200 else 'sample_answer'} for FlashRank (len={len(flashrank_query)})")
+            
+            passages = []
+            id_to_index = {}
+            for i, candidate in enumerate(candidates):
+                cand_text = candidate.get("text", "")
+                if cand_text and len(cand_text.strip()) > 0:
+                    cand_id = candidate.get("id", "")
+                    if not cand_id:
+                        cand_id = f"cand_{i}"
+                    passages.append({"id": cand_id, "text": cand_text})
+                    id_to_index[cand_id] = i
+                else:
+                    print(f"[BERT_FILTER] WARNING: Candidate {i} has empty text, skipping")
+            
+            if not passages:
+                print("[BERT_FILTER] ERROR: No valid passages found!")
+                for candidate in candidates:
+                    candidate["scores"]["answer_match"] = candidate.get("scores", {}).get("cross", 0.0)
+            else:
+                print(f"[BERT_FILTER] Created {len(passages)} valid passages for reranking")
+                print(f"[BERT_FILTER] First passage preview: id={passages[0].get('id')}, text_len={len(passages[0].get('text', ''))}")
+                
+                request = RerankRequest(query=flashrank_query, passages=passages)
+                ranked = reranker.rerank(request)
+                print(f"[BERT_FILTER] FlashRank returned {len(ranked) if ranked else 0} ranked results")
+                
+                if ranked:
+                    print(f"[BERT_FILTER] First ranked result full structure: {ranked[0]}")
+                    print(f"[BERT_FILTER] First ranked result keys: {ranked[0].keys() if isinstance(ranked[0], dict) else 'Not a dict'}")
+                
+                # FlashRank returns: {"id": "...", "score": float} or {"id": "...", "relevance_score": float}
+                # Check which field name is used
+                score_field = None
+                if ranked and len(ranked) > 0:
+                    first_result = ranked[0]
+                    if isinstance(first_result, dict):
+                        if "score" in first_result:
+                            score_field = "score"
+                        elif "relevance_score" in first_result:
+                            score_field = "relevance_score"
+                
+                print(f"[BERT_FILTER] FlashRank score field: {score_field}")
+                
+                # Create a mapping of id to score
+                score_map = {}
+                if ranked and score_field:
+                    for r in ranked:
+                        r_id = r.get("id")
+                        r_score = r.get(score_field, 0.0)
+                        if r_id:
+                            score_map[r_id] = float(r_score)
+                            print(f"[BERT_FILTER] Mapped id={r_id[:20]}... -> score={float(r_score):.4f}")
+                
+                print(f"[BERT_FILTER] Score map size: {len(score_map)}, keys: {list(score_map.keys())[:3] if score_map else []}")
+                
+                # Map scores back to candidates
+                for i, candidate in enumerate(candidates):
+                    cand_id = candidate.get("id", "")
+                    if not cand_id:
+                        cand_id = f"cand_{i}"
+                    
+                    # Try exact ID match
+                    score_val = score_map.get(cand_id)
+                    
+                    if score_val is None:
+                        # Try fallback ID format
+                        fallback_id = f"cand_{i}"
+                        score_val = score_map.get(fallback_id)
+                    
+                    if score_val is None:
+                        # Use original cross score as fallback
+                        score_val = candidate.get("scores", {}).get("cross", 0.0)
+                        print(f"[BERT_FILTER] Candidate {i}: No score found (id={cand_id[:20]}...), using original cross score={score_val:.4f}")
+                    else:
+                        print(f"[BERT_FILTER] Candidate {i}: id={cand_id[:20]}..., score={score_val:.4f}")
+                    
+                    candidate["scores"]["answer_match"] = score_val
+                    
+        elif hasattr(reranker, "predict"):
+            # CrossEncoder path - batch predict
+            # NOTE: CrossEncoder expects (query, text) pairs
+            print("[BERT_FILTER] Using CrossEncoder.predict path")
+            
+            # Check if candidate texts are not empty
+            valid_candidates = []
+            valid_indices = []
+            for i, candidate in enumerate(candidates):
+                cand_text = candidate.get("text", "")
+                if cand_text and len(cand_text.strip()) > 0:
+                    valid_candidates.append((comparison_text, cand_text))
+                    valid_indices.append(i)
+                else:
+                    print(f"[BERT_FILTER] WARNING: Candidate {i} has empty text, skipping")
+            
+            if not valid_candidates:
+                print("[BERT_FILTER] ERROR: No valid candidates with text found!")
+                for candidate in candidates:
+                    candidate["scores"]["answer_match"] = candidate.get("scores", {}).get("cross", 0.0)
+            else:
+                print(f"[BERT_FILTER] Created {len(valid_candidates)} valid pairs for prediction")
+                print(f"[BERT_FILTER] First pair preview: query_len={len(valid_candidates[0][0])}, text_len={len(valid_candidates[0][1])}")
+                
+                # Test with a single pair first to verify reranker works
+                if len(valid_candidates) > 0:
+                    test_pair = valid_candidates[0]
+                    print(f"[BERT_FILTER] Testing reranker with single pair: query_len={len(test_pair[0])}, text_len={len(test_pair[1])}")
+                    try:
+                        test_score = reranker.predict([test_pair])
+                        print(f"[BERT_FILTER] Test score result: {test_score}, type: {type(test_score)}")
+                        if hasattr(test_score, '__len__') and len(test_score) > 0:
+                            test_val = float(test_score[0])
+                            print(f"[BERT_FILTER] Test score value: {test_val:.4f}")
+                            if test_val == 0.0:
+                                print("[BERT_FILTER] WARNING: Test score is 0.0 - reranker might not be working correctly!")
+                    except Exception as test_e:
+                        print(f"[BERT_FILTER] ERROR in test prediction: {test_e}")
+                        import traceback
+                        traceback.print_exc()
+                
+                scores = reranker.predict(valid_candidates)
+                print(f"[BERT_FILTER] Raw scores from predict: {scores}")
+                print(f"[BERT_FILTER] Scores type: {type(scores)}")
+                print(f"[BERT_FILTER] Scores length: {len(scores) if hasattr(scores, '__len__') else 'N/A'}")
+                
+                # Handle numpy array or list
+                if hasattr(scores, 'tolist'):
+                    scores = scores.tolist()
+                    print(f"[BERT_FILTER] Converted numpy array to list")
+                elif hasattr(scores, '__iter__') and not isinstance(scores, (str, bytes)):
+                    scores = list(scores)
+                    print(f"[BERT_FILTER] Converted iterable to list")
+                elif not isinstance(scores, list):
+                    print(f"[BERT_FILTER] WARNING: Scores is not a list, array, or iterable: {type(scores)}")
+                    scores = [scores] if scores is not None else []
+                
+                print(f"[BERT_FILTER] Processed scores list: {scores}")
+                print(f"[BERT_FILTER] Scores range: min={min(scores) if scores else 'N/A'}, max={max(scores) if scores else 'N/A'}")
+                
+                # Map scores back to original candidates
+                score_idx = 0
+                for i, candidate in enumerate(candidates):
+                    if i in valid_indices:
+                        if score_idx < len(scores):
+                            try:
+                                score_val = float(scores[score_idx])
+                                if score_val == 0.0:
+                                    print(f"[BERT_FILTER] WARNING: Candidate {i} got score 0.0 from reranker")
+                                candidate["scores"]["answer_match"] = score_val
+                                print(f"[BERT_FILTER] Candidate {i}: score={score_val:.4f}, id={candidate.get('id', 'unknown')[:50]}")
+                                score_idx += 1
+                            except (ValueError, TypeError) as conv_e:
+                                print(f"[BERT_FILTER] ERROR converting score for candidate {i}: {conv_e}, score={scores[score_idx]}")
+                                candidate["scores"]["answer_match"] = candidate.get("scores", {}).get("cross", 0.0)
+                                score_idx += 1
+                        else:
+                            print(f"[BERT_FILTER] Candidate {i}: Score index out of range, using original cross score")
+                            candidate["scores"]["answer_match"] = candidate.get("scores", {}).get("cross", 0.0)
+                    else:
+                        print(f"[BERT_FILTER] Candidate {i}: Empty text, using original cross score")
+                        candidate["scores"]["answer_match"] = candidate.get("scores", {}).get("cross", 0.0)
+        else:
+            # Fallback: use original cross-encoder scores
+            print("[BERT_FILTER] No reranker available, using original scores")
+            for candidate in candidates:
+                candidate["scores"]["answer_match"] = candidate.get("scores", {}).get("cross", 0.0)
+    except Exception as e:
+        print(f"[BERT_FILTER] Error during batch re-scoring: {e}")
+        import traceback
+        traceback.print_exc()
+        # Fallback to original scores
+        for candidate in candidates:
+            candidate["scores"]["answer_match"] = candidate.get("scores", {}).get("cross", 0.0)
+    
+    # Filter by answer_match score threshold
+    qualified = [c for c in candidates if c.get("scores", {}).get("answer_match", 0.0) > min_score]
+    
+    # Sort by answer_match score (descending)
+    qualified = sorted(qualified, key=lambda x: x.get("scores", {}).get("answer_match", 0.0), reverse=True)
+    
+    print(f"[BERT_FILTER] Score distribution: {[round(c.get('scores', {}).get('answer_match', 0.0), 3) for c in candidates[:5]]}")
+    
+    # FALLBACK: If no qualified chunks, use top 2 based on original cross scores (let LLM judge)
+    if len(qualified) == 0:
+        print(f"[BERT_FILTER] WARNING: No qualified chunks found (all scores <= {min_score})")
+        print(f"[BERT_FILTER] FALLBACK: Using top 2 chunks based on original cross scores for LLM to judge")
+        # Sort all candidates by original cross score
+        all_sorted = sorted(candidates, key=lambda x: x.get("scores", {}).get("cross", 0.0), reverse=True)
+        answer_chunks = all_sorted[:2]
+        print(f"[BERT_FILTER] Fallback selected top 2 chunks with cross scores: {[c.get('scores', {}).get('cross', 0.0) for c in answer_chunks]}")
+    else:
+        # Take top 4 qualified for answer
+        answer_chunks = qualified[:4]
+    
+    print(f"[BERT_FILTER] Qualified chunks (answer_match score > {min_score}): {len(qualified)}")
+    print(f"[BERT_FILTER] Selected {len(answer_chunks)} answer chunks")
+    
+    timer.mark("done")
+    return answer_chunks
+
+# Keep judge_sufficiency for backward compatibility (not used in new flow)
+def judge_sufficiency(query: str, candidates: List[Dict[str, Any]], judge_llm: ChatOpenAI | None = None, threshold_weak: float = 0.25) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Judge each candidate chunk individually for sufficiency.
+    Return the top 4 qualified chunks for answering,
+    and next 2 for follow-up suggestion.
+    """
+    global gemini_llm # Use Gemini for judging instead of OpenAI
+
+    if judge_llm is None: # Use Gemini LLM for judging
+        judge_llm = gemini_llm
+
+    qualified_with_scores = [] # Store qualified chunks along with their cross-encoder scores and topic_match
+    followup_chunks_raw = [] # Store non-qualified chunks for potential follow-up
+    topic_match_order = {"strong": 3, "medium": 2, "absolutely_not_possible": 1}
+
+    print(f"[judge_sufficiency] len of candidates {len(candidates)}")
+    print("[judge_sufficiency] Using GEMINI LLM for judging")
+    timer = CheckpointTimer("judge_sufficiency")
+
+    # Prepare snippets for batch judging
+    snippets_for_llm = []
+    for idx, c in enumerate(candidates):
+        snippet_text = f"Source: {c['meta'].get('doc_name', 'unknown')}\nExcerpt: {c['text']}"
+        snippets_for_llm.append(f"Snippet {idx}:\n{snippet_text}")
+    
+    combined_snippets = "\n\n".join(snippets_for_llm)
+    
+    prompt = judge_prompt.format(query=query, context_snippets=combined_snippets)
+
+    try:
+        resp = judge_llm.invoke([HumanMessage(content=prompt)]).content
+        # PRINT: raw judge LLM response for demo/inspection
+        #print("[JUDGE_RAW_RESP]:", resp)
+        timer.mark("judge_llm.invoke")
+        parsed_judgments = safe_json_parse(resp)
+        # PRINT: parsed judgments (or None)
+        print("[JUDGE_PARSED]:", parsed_judgments)
+        if parsed_judgments and "judgments" in parsed_judgments:
+            for judgment in parsed_judgments["judgments"]:
+                idx = judgment.get("index")
+                if idx is not None and 0 <= idx < len(candidates):
+                    c = candidates[idx]
+                    topic_match_label = judgment.get("topic_match", "absolutely_not_possible")
+                    c['meta']['topic_match_score'] = topic_match_order.get(topic_match_label, 0)
+                    if judgment.get("sufficient", False):
+                        qualified_with_scores.append(c)
+                    else:
+                        followup_chunks_raw.append(c)
+                else:
+                    print(f"[judge_sufficiency] Invalid index in LLM judgment: {judgment}")
+                    # Fallback for invalid index
+                    if c["scores"]["cross"] > threshold_weak:
+                        qualified_with_scores.append(c)
+                    else:
+                        followup_chunks_raw.append(c)
+        else:
+            print("[judge_sufficiency] LLM did not return valid batched judgments. Falling back to cross-encoder scores.")
+            print("[JUDGE_PARSED]: None or invalid format; falling back to cross-encoder scores")
+            # Fallback based on cross-encoder score if LLM fails to parse or returns no judgments
+            for c in candidates:
+                c['meta']['topic_match_score'] = topic_match_order.get("medium", 0) # Assign a default topic_match_score
+                if c["scores"]["cross"] > threshold_weak:
+                    qualified_with_scores.append(c)
+                else:
+                    followup_chunks_raw.append(c)
+    except Exception as e:
+        print(f"[judge_sufficiency] Error during batched LLM judging: {e}")
+        # Fallback based on cross-encoder score if LLM invocation fails
+        print(f"[JUDGE_ERROR]: {e}")
+        for c in candidates:
+            c['meta']['topic_match_score'] = topic_match_order.get("medium", 0) # Assign a default topic_match_score
+            if c["scores"]["cross"] > threshold_weak:
+                qualified_with_scores.append(c)
+            else:
+                followup_chunks_raw.append(c)
+
+    # NEW: Sort qualified chunks first by topic_match_score (desc), then by cross score (desc)
+    qualified = sorted(qualified_with_scores, 
+                       key=lambda x: (x['meta'].get('topic_match_score', 0), x.get("scores", {}).get("cross", 0.0)), 
+                       reverse=True)
+    timer.mark("sort_qualified")
+    
+    print(f"[judge_sufficiency] BEFORE answer_chunks={len(qualified)} BEFORE followup_chunks={len(followup_chunks_raw)}")
+    
+    answer_chunks = qualified[:4] # Take top 4 from the re-sorted qualified list
+    
+    # Ensure all followup candidates also have a topic_match_score for consistent sorting
+    for c in followup_chunks_raw:
+        if 'topic_match_score' not in c['meta']:
+            c['meta']['topic_match_score'] = topic_match_order.get("absolutely_not_possible", 0) # Default for raw fallbacks
+
+    # Now, combine any remaining qualified chunks with the initially non-qualified ones for follow-up
+    # This ensures higher-scored but not-top-4 answer chunks can still be follow-ups
+    remaining_qualified_for_followup = qualified[4:]
+    
+    # Sort these combined candidates using the same two-tier logic
+    combined_followup_candidates = sorted(followup_chunks_raw + remaining_qualified_for_followup, 
+                                          key=lambda x: (x['meta'].get('topic_match_score', 0), x["scores"]["cross"]), 
+                                          reverse=True)
+    
+    followup_chunks = combined_followup_candidates[:2]
+    
+    # PRINT: summary of selection for demo
+    print(f"[JUDGE_SELECTION] answers={len(answer_chunks)} followups={len(followup_chunks)}")
+    if answer_chunks:
+        print("[JUDGE_TOP_IDS]", [c.get('id') for c in answer_chunks])
+    if followup_chunks:
+        print("[JUDGE_FOLLOWUP_IDS]", [c.get('id') for c in followup_chunks])
+
+    print(f"[judge_sufficiency] AFTER answer_chunks={len(answer_chunks)} AFTER followup_chunks={len(followup_chunks)}")
+    timer.mark("done")
+    return {"answer_chunks": answer_chunks, "followup_chunks": followup_chunks}
+
+def synthesize_answer(query: str, top_candidates: List[Dict[str, Any]], main_llm: ChatOpenAI | None = None) -> str:
+    global gemini_llm # Use Gemini for synthesis instead of OpenAI
+
+    if main_llm is None: # Use Gemini LLM for synthesis
+        main_llm = gemini_llm
+
+    # Build context from top candidates
+    sources = []
+    ctx_parts = []
+    for c in top_candidates[:4]:
+        src = c.get("meta", {}).get("doc_name", "unknown")
+        if src not in sources:
+            sources.append(src)
+        # Expand document name in context so LLM sees full names everywhere
+        # expand_document_name handles all normalization (extensions, case, spaces)
+        src_expanded = expand_document_name(src) if src else "unknown"
+        ctx_parts.append(f"From [{src_expanded}]:\\n{c['text']}")
+    context = "\\n\\n".join(ctx_parts)
+    # Expand document abbreviations to full names for sources string
+    sources_str = expand_sources_string(sources) if sources else "unknown"
+    print(f"[synthesize_answer] Expanded sources: {sources_str}")
+
+    prompt = answer_prompt.format(
+        sources=sources_str,
+        context=context,
+        query=query
+    )
+    print("[answer] sending synthesis prompt to GEMINI LLM (with improved multi-source consolidation)")
+    timer = CheckpointTimer("synthesize_answer")
+    resp = main_llm.invoke([HumanMessage(content=prompt)]).content
+    timer.mark("synthesize_llm.invoke")
+
+    return resp
+
+async def synthesize_answer_stream(query: str, top_candidates: List[Dict[str, Any]], main_llm: ChatGoogleGenerativeAI | None = None):
+    """
+    Streaming version of synthesize_answer that yields tokens as they arrive.
+    Returns an async generator that yields token chunks.
+    """
+    global gemini_llm
+
+    if main_llm is None:
+        main_llm = gemini_llm
+
+    # Build context from top candidates (same as non-streaming version)
+    sources = []
+    ctx_parts = []
+    for c in top_candidates[:4]:
+        src = c.get("meta", {}).get("doc_name", "unknown")
+        if src not in sources:
+            sources.append(src)
+        src_expanded = expand_document_name(src) if src else "unknown"
+        ctx_parts.append(f"From [{src_expanded}]:\\n{c['text']}")
+    context = "\\n\\n".join(ctx_parts)
+    sources_str = expand_sources_string(sources) if sources else "unknown"
+    print(f"[synthesize_answer_stream] Expanded sources: {sources_str}")
+
+    prompt = answer_prompt.format(
+        sources=sources_str,
+        context=context,
+        query=query
+    )
+    print("[answer_stream] sending synthesis prompt to GEMINI LLM (streaming mode)")
+
+    try:
+        # Use astream for async streaming
+        async for chunk in main_llm.astream([HumanMessage(content=prompt)]):
+            if chunk.content:
+                yield chunk.content
+    except Exception as e:
+        print(f"[synthesize_answer_stream] Error during streaming: {e}")
+        # Fallback: yield error message
+        yield f"\n[Error: {str(e)}]"
+
+# -------------------- CLASSIFY / REFORMULATE / CHITCHAT --------------------
+def classify_message(chat_history: str, user_message: str) -> Tuple[str, str]:
+    prompt = classifier_prompt.format(chat_history=chat_history, question=user_message)
+    print("[classify] sending classification prompt")
+    try:
+        # Prefer the dedicated classifier LLM for speed/consistency
+        use_llm = classifier_llm if classifier_llm is not None else llm
+        resp = use_llm.invoke([HumanMessage(content=prompt)]).content
+        # PRINT: raw classifier response
+        print("[CLASSIFIER_RAW]:", resp)
+        parsed = safe_json_parse(resp)
+        # PRINT: parsed classifier output
+        print("[CLASSIFIER_PARSED]:", parsed)
+        if parsed:
+            return parsed.get("label", "MEDICAL_QUESTION"), parsed.get("reason", "")
+    except Exception as e:
+        print(f"[classify] LLM classify failed: {e}")
+
+    # # fallback heuristics
+    # low = user_message.lower().strip()
+    # if low in ("yes", "sure", "ok", "yep") and "Would you like to know about" in chat_history:
+    #     return "FOLLOW_UP", "affirmation heuristic"
+    # if any(w in low for w in ("hi", "hello", "thanks", "thank you", "bye")):
+    #     return "CHITCHAT", "greeting heuristic"
+
+def reformulate_query(chat_history: str, user_message: str, classify_label: str) -> Tuple[str, Dict[str, str]]:
+    global llm # Access global llm
+    print("[reformulate] start")
+    print("claasification label:", classify_label)
+    timer = CheckpointTimer("reformulate_query")
+    prompt = f"""
+Return JSON only: {{"Rewritten":"...","Correction":{{"...":"..."}}}}
+
+You are a careful medical query rewriter for a clinical assistant. Rephrase question capturing user's intent and easily searchable for a RAG application.
+If label is chitchat/CHITCHAT -> return as it is no change or reformulation 
+
+Rules:
+- if label is chitchat/CHITCHAT -> return as it is no change or reformulation 
+- If user has mentioned or few words on a medical term: Rewrite it to frame a question like "Give information about <x> and cure if available"
+- If user's input is a FOLLOW_UP (additional questions, inputs about last answer) about a prior interaction, using CHAT_HISTORY, LAST QUESTION, LAST ANSWER rewrite into a full question.
+- If input is a short affirmation (e.g., "yes","sure",etc.) → rephrase FOLLOW UP QUESTION FROM LAST RESPONSE into an independent standalone question.
+- Expand common medical abbreviations where unambiguous (IUFD -> Intrauterine fetal death). If unknown, leave unchanged.
+- Only correct spelling/abbreviations when it changes meaning. Report such correction in Correction.
+- ALso append Abbreviations in Correction
+- If input is chitchat or profanity, append "_chitchat" to Rewritten.
+- Keep rewritten concise and medically precise.
+
+Few tricky examples:
+
+-chat_history: ""
+classify_label: "FOLLOW_UP"
+question: "hello how are you?"
+-> Rewritten: "hello how are you?_chitchat", Correction: {{}}
+
+-chat_history: ""
+classify_label: "CHITCHAT"
+question: "hi"
+-> Rewritten: "hi_chitchat", Correction: {{}}
+
+- chat_history: "Assistant: <answer> Would you like to know about malaria prevention?"
+  classify_label: "FOLLOW_UP"
+  question: "sure"
+  -> Rewritten: "provide details on prevention of malaria", Correction: {{}}
+
+- chat_history: ""
+  question: "denger sign for johndice"
+  -> Rewritten: "What are the danger signs for jaundice?", Correction: {{"johndice":"jaundice"}}
+
+- chat_history: ""
+  question: "depression"
+  -> Rewritten: "Give information about depression and cure if available", Correction: {{}}
+  
+- chat_history: "Assistant: Would you like to know about postpartum hemorrhage?"
+  question: "any treatment?"
+  -> Rewritten: "What are treatments for postpartum hemorrhage?", Correction: {{}}
+
+-chat_history: "<answer> would you like to know about newborn jaundice?"
+question: "yes"
+-> Rewritten: "Provide details on newborn jaundice", Correction: {{}}
+
+- chat_history: "<answer> would you like to know about newborn jaundice?"
+question: "sure but also provide cure"
+-> Rewritten: "Provide details on newborn jaundice and its cure", Correction: {{}}
+
+classify :
+{classify_label}
+chat_history:
+{chat_history}
+user_message:
+{user_message}
+
+NOW REWRITE or return as it is in case of chitchat :
+"""
+    print("[reformulate] sending reformulation prompt")
+    try:
+        # Attempt LLM invocation
+        try:
+            resp = reformulate_llm.invoke([HumanMessage(content=prompt)]).content
+            # PRINT: raw reformulation response
+            print("[REFORM_RAW]:", resp)
+            timer.mark("llm.invoke")
+            print(f"[reformulate] Raw LLM response: {resp}")
+        except Exception as llm_e:
+            print(f"[reformulate] Error during LLM invoke in reformulate_query: {llm_e}")
+            # If LLM invocation fails, return user_message and empty dict as a fallback
+            return user_message, {}
+
+        parsed = safe_json_parse(resp)
+        # PRINT: parsed reformulation output
+        print("[REFORM_PARSED]:", parsed)
+        print(f"[reformulate] Parsed LLM response: {parsed}")
+        if parsed:
+            # Ensure Correction is always a dictionary
+            correction_output = parsed.get("Correction", {})
+            if isinstance(correction_output, str):
+                correction_output = {}
+
+            rewritten = parsed.get("Rewritten", user_message) or user_message
+
+           
+            return rewritten, correction_output
+    except Exception as e:
+        print(f"[reformulate] General error in reformulate_query: {e}")
+    return user_message, {} # Default to empty dict for correction in all failure cases
+
+def classify_and_reformulate(chat_history: str, user_message: str, last_3_qa_pairs: str = "") -> Tuple[str, str, str, Dict[str, str], str]:
+    """
+    Combined classification and reformulation using Gemini in a single LLM call.
+    Returns: (classification, reason, rewritten_query, corrections, sample_answer)
+    
+    Args:
+        chat_history: Full chat history context
+        user_message: Current user message
+        last_3_qa_pairs: Last 3 non-chitchat Q&A pairs formatted for FOLLOW_UP reformulation
+                        Format: "User: <q1> | Bot: <a1>\nUser: <q2> | Bot: <a2>\nUser: <q3> | Bot: <a3>"
+                        Allows LLM to understand conversation context and link follow-ups to MAIN topic
+    """
+    global gemini_llm
+    
+    print("="*60)
+    print("CLASSIFICATION + REFORMULATION BLOCK")
+    print("="*60)
+    
+    # Start timing for this block
+    block_start = time.perf_counter()
+    
+    # Use last_3_qa_pairs if available, otherwise fall back to chat_history
+    # This allows LLM to understand conversation flow and link follow-ups to the MAIN topic
+    chat_history_for_prompt = last_3_qa_pairs if last_3_qa_pairs else chat_history
+    if last_3_qa_pairs:
+        print(f"[CLASSIFY_REFORM] Using last 3 Q&A pairs for reformulation context")
+        print(f"[CLASSIFY_REFORM] Context preview: {last_3_qa_pairs[:200]}...")
+    
+    prompt = combined_classify_reformulate_prompt.format(chat_history=chat_history_for_prompt, question=user_message)
+    print(f"[CLASSIFY_REFORM] Input: {user_message[:100]}...")
+    print(f"[CLASSIFY_REFORM] Chat history length: {len(chat_history)}")
+    print("[CLASSIFY_REFORM] Sending prompt to Gemini...")
+    
+    try:
+        # Time the LLM call specifically
+        llm_start = time.perf_counter()
+        resp = gemini_llm.invoke([HumanMessage(content=prompt)]).content
+        llm_end = time.perf_counter()
+        
+        print(f"[CLASSIFY_REFORM] Gemini LLM call took {llm_end - llm_start:.3f} seconds")
+        
+        # Print raw response for debugging
+        print("[CLASSIFY_REFORM] Raw Gemini response:")
+        print("-" * 40)
+        print(resp)
+        print("-" * 40)
+        
+        # Parse JSON response
+        parse_start = time.perf_counter()
+        parsed = safe_json_parse(resp)
+        parse_end = time.perf_counter()
+        
+        print(f"[CLASSIFY_REFORM] JSON parsing took {parse_end - parse_start:.3f} seconds")
+        print("[CLASSIFY_REFORM] Parsed JSON:")
+        print("-" * 40)
+        print(parsed)
+        print("-" * 40)
+        
+        if parsed:
+            classification = parsed.get("classification", "MEDICAL_QUESTION")
+            reason = parsed.get("reason", "")
+            rewritten_query = parsed.get("rewritten_query", user_message)
+            corrections = parsed.get("corrections", {})
+            sample_answer = parsed.get("sample_answer", "")
+            
+            # Ensure corrections is always a dict
+            if not isinstance(corrections, dict):
+                corrections = {}
+            
+            # For CHITCHAT, use original message unchanged and empty sample_answer
+            if classification.upper() == "CHITCHAT":
+                print("[CLASSIFY_REFORM] CHITCHAT detected - using original message unchanged")
+                rewritten_query = user_message
+                corrections = {}
+                sample_answer = ""
+            
+            # Ensure sample_answer is a string (fallback to empty if not provided)
+            if not isinstance(sample_answer, str):
+                sample_answer = ""
+            
+            # Print detailed outputs
+            print("[CLASSIFY_REFORM] EXTRACTED RESULTS:")
+            print(f"  Classification: {classification}")
+            print(f"  Reason: {reason}")
+            print(f"  Rewritten Query: {rewritten_query}")
+            print(f"  Corrections: {corrections}")
+            print(f"  Sample Answer Length: {len(sample_answer)} chars")
+            if sample_answer:
+                print(f"  Sample Answer Full Text: {sample_answer}")
+                print(f"  Sample Answer Preview: {sample_answer[:150]}...")
+            else:
+                print("  Sample Answer: EMPTY (will use original query for BERT comparison)")
+            
+            block_end = time.perf_counter()
+            print(f"[CLASSIFY_REFORM] TOTAL BLOCK TIME: {block_end - block_start:.3f} seconds")
+            print("="*60)
+            
+            return classification, reason, rewritten_query, corrections, sample_answer
+        else:
+            print("[CLASSIFY_REFORM] Failed to parse JSON response")
+            
+    except Exception as e:
+        print(f"[CLASSIFY_REFORM] Gemini LLM call failed: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # Fallback: return original message with default classification
+    block_end = time.perf_counter()
+    print(f"[CLASSIFY_REFORM] FALLBACK - TOTAL BLOCK TIME: {block_end - block_start:.3f} seconds")
+    print("="*60)
+    return "MEDICAL_QUESTION", "fallback", user_message, {}, ""
+
+def handle_chitchat(user_message: str, chat_history: str) -> str:
+    global gemini_llm
+    prompt = chitchat_prompt.format(conversation=user_message, chat_history=chat_history)
+    print("[chitchat] sending to GEMINI chitchat model")
+    try:
+        return gemini_llm.invoke([HumanMessage(content=prompt)]).content
+    except Exception as e:
+        print(f"[chitchat] Gemini LLM failed: {e}")
+        return "Whoa, let's keep it polite, please! 😊"
+
+# -------------------- VIDEO MATCHING SYSTEM (SIMPLIFIED BERT APPROACH) --------------------
+# Import video embedding cache
+try:
+    import sys
+    from pathlib import Path
+    # Add current directory to path for local import
+    cache_module_path = Path(__file__).parent
+    if str(cache_module_path) not in sys.path:
+        sys.path.insert(0, str(cache_module_path))
+    from video_embedding_cache import VideoEmbeddingCache
+    VIDEO_CACHE_AVAILABLE = True
+except ImportError as e:
+    VIDEO_CACHE_AVAILABLE = False
+    print(f"[VIDEO_SYSTEM] WARNING: video_embedding_cache module not found ({e}), using fallback mode")
+
+class VideoMatchingSystem:
+    def __init__(self, video_file_path: str = None, use_cache: bool = True):
+        """Initialize the simplified video matching system using BERT similarity"""
+        # Resolve path: FILES/ is at project root, not in FASTAPI-DEPLOYMENT/
+        if video_file_path is None:
+            script_dir = Path(__file__).parent  # FASTAPI-DEPLOYMENT/
+            project_root = script_dir.parent    # RHL-FASTAPI/
+            video_file_path = str(project_root / "FILES" / "video_link_topic.xlsx")
+            # Fallback to relative path if absolute doesn't exist
+            if not Path(video_file_path).exists():
+                video_file_path = "./FILES/video_link_topic.xlsx"
+        self.video_file_path = video_file_path
+        self.topic_list = []  # List of topic strings
+        self.url_list = []    # List of corresponding URLs
+        self.topic_embeddings = None  # Pre-computed embeddings
+        self.use_cache = use_cache and VIDEO_CACHE_AVAILABLE
+        
+        # Try to use cache first
+        if self.use_cache:
+            print("[VIDEO_SYSTEM] Initializing video embedding cache...")
+            self.embedding_cache = VideoEmbeddingCache(video_file_path=video_file_path)
+            if self.embedding_cache.initialize():
+                self.topic_list, self.url_list, self.topic_embeddings = self.embedding_cache.get_cached_embeddings()
+                print(f"[VIDEO_SYSTEM] Loaded {len(self.topic_list)} video embeddings from cache")
+            else:
+                print("[VIDEO_SYSTEM] Cache initialization failed, falling back to standard mode")
+                self.use_cache = False
+        
+        # Fallback: Load video data and initialize model (if cache not available)
+        if not self.use_cache:
+            self._load_video_data()
+            # Initialize BERT model for similarity (only if not using cache)
+            print("[VIDEO_SYSTEM] Loading BERT model for semantic similarity...")
+            self.similarity_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+            print("[VIDEO_SYSTEM] BERT model loaded successfully")
+        else:
+            # For cache mode, model will be loaded lazily when encoding answers
+            self.similarity_model = None
+    
+    def _load_video_data(self):
+        """Load and preprocess video data into simple lists using Description column"""
+        try:
+            df = pd.read_excel(self.video_file_path)
+            print(f"[VIDEO_SYSTEM] Loaded {len(df)} videos from {self.video_file_path}")
+            
+            # Create simple lists using Description column instead of video_topic
+            for idx, row in df.iterrows():
+                description = row['Description'].strip()
+                url = row['URL'].strip()
+                
+                if description and url:
+                    self.topic_list.append(description)
+                    self.url_list.append(url)
+            
+            print(f"[VIDEO_SYSTEM] Created description_list with {len(self.topic_list)} descriptions")
+            print(f"[VIDEO_SYSTEM] Sample descriptions:")
+            for i, desc in enumerate(self.topic_list[:3]):
+                print(f"  {i}: {desc[:100]}...")
+            
+        except Exception as e:
+            print(f"[VIDEO_SYSTEM] Error loading video data: {e}")
+            self.topic_list = []
+            self.url_list = []
+    
+    def find_relevant_video(self, answer: str) -> Optional[str]:
+        """Find relevant video using BERT similarity + LLM verification"""
+        if not self.topic_list:
+            return None
+        
+        print(f"[VIDEO_SYSTEM] Searching for video for answer: {answer[:100]}...")
+        
+        # Step 1: BERT Semantic Similarity
+        print("[VIDEO_SYSTEM] Step 1: Computing BERT semantic similarities...")
+        bert_start = time.perf_counter()
+        
+        # Use cached embeddings if available, otherwise encode on-the-fly
+        if self.use_cache and self.topic_embeddings is not None:
+            # Only encode the answer (embeddings for topics are pre-computed)
+            answer_embedding = self.embedding_cache.encode_answer(answer)
+            answer_embedding = answer_embedding.reshape(1, -1)  # Reshape for cosine_similarity
+            topic_embeddings = self.topic_embeddings
+            print(f"[VIDEO_SYSTEM] Using cached video embeddings ({len(self.topic_list)} videos)")
+        else:
+            # Fallback: encode answer and all topics (original behavior)
+            answer_embedding = self.similarity_model.encode([answer])
+            topic_embeddings = self.similarity_model.encode(self.topic_list)
+        
+        # Compute cosine similarities
+        similarities = cosine_similarity(answer_embedding, topic_embeddings)[0]
+        
+        # Find best match
+        best_idx = np.argmax(similarities)
+        best_similarity = similarities[best_idx]
+        
+        bert_end = time.perf_counter()
+        print(f"[VIDEO_SYSTEM] BERT similarity computation took {bert_end - bert_start:.3f} seconds")
+        print(f"[VIDEO_SYSTEM] Best similarity score: {best_similarity:.3f}")
+        print(f"[VIDEO_SYSTEM] Best description: {self.topic_list[best_idx][:100]}...")
+        
+        # Step 2: Threshold gating without LLM reconfirmation
+        if best_similarity >= 0.60:
+            video_url = self.url_list[best_idx]
+            print(f"[VIDEO_SYSTEM] Similarity >= 0.60, returning video directly: {video_url}")
+            return video_url
+        else:
+            print(f"[VIDEO_SYSTEM] Similarity score {best_similarity:.3f} below threshold 0.60 - no video")
+            return None
+    
+    def _verify_with_llm(self, answer: str, description: str) -> bool:
+        """Use Gemini to verify if the video description is contextually relevant to the answer"""
+        prompt = f"""Analyze if the video description majorly aligns with the medical answer with referance to the below rules
+
+
+
+Question: Is this video description DIRECTLY and STRONGLY related to the medical answer?
+
+Rules:
+- Return "YES" only if the video description directly addresses the same medical condition, procedure, or treatment mentioned in the answer
+- Return "NO" if the description is related but not directly relevant (e.g., general care vs specific procedure)
+- Return "NO" if the description is about a different medical condition entirely
+
+Examples:
+- Answer about "eye care for newborns" + Description "video about applying eye medication to prevent infections" → YES
+- Answer about "eye care for newborns" + Description "video about umbilical cord care procedures" → NO
+- Answer about "temperature measurement" + Description "video about using thermometer to check baby temperature" → YES
+Medical Answer: ```{answer}```
+
+Video Description: ```{description}```
+Response (YES/NO only):"""
+
+        try:
+            response = gemini_llm.invoke([HumanMessage(content=prompt)]).content.strip().upper()
+            print(f"[VIDEO_SYSTEM] LLM response: {response}")
+            return response == "YES"
+        except Exception as e:
+            print(f"[VIDEO_SYSTEM] LLM verification failed: {e}")
+            return False
+
+# -------------------- CACHE SYSTEM (RERANKER + LLM APPROACH) --------------------
+class CacheSystem:
+    def __init__(self, cache_file_path: str = None):
+        """Initialize the cache system using reranker (same logic as bert_filter_candidates) + LLM verification"""
+        # Resolve path: FILES/ is at project root, not in FASTAPI-DEPLOYMENT/
+        if cache_file_path is None:
+            script_dir = Path(__file__).parent  # FASTAPI-DEPLOYMENT/
+            project_root = script_dir.parent    # RHL-FASTAPI/
+            cache_file_path = str(project_root / "FILES" / "cache_questions.xlsx")
+            # Fallback to relative path if absolute doesn't exist
+            if not Path(cache_file_path).exists():
+                cache_file_path = "./FILES/cache_questions.xlsx"
+        self.cache_file_path = cache_file_path
+        self.question_list = []  # List of cached questions
+        self.answer_list = []    # List of corresponding answers
+        
+        # Load cache data
+        self._load_cache_data()
+        
+        # Note: We use global reranker (same as bert_filter_candidates) instead of separate BERT model
+    
+    def _load_cache_data(self):
+        """Load cache data from Excel file"""
+        try:
+            df = pd.read_excel(self.cache_file_path)
+            print(f"[CACHE_SYSTEM] Loaded {len(df)} cached Q&A pairs from {self.cache_file_path}")
+            
+            # Create simple lists
+            for idx, row in df.iterrows():
+                question = row['question'].strip()
+                answer = row['answer'].strip()
+                
+                if question and answer:
+                    self.question_list.append(question)
+                    self.answer_list.append(answer)
+            
+            print(f"[CACHE_SYSTEM] Created cache with {len(self.question_list)} questions")
+            print(f"[CACHE_SYSTEM] Sample cached questions:")
+            for i, q in enumerate(self.question_list[:3]):
+                print(f"  {i}: {q[:80]}...")
+            
+        except Exception as e:
+            print(f"[CACHE_SYSTEM] Error loading cache data: {e}")
+            self.question_list = []
+            self.answer_list = []
+    
+    def check_cache(self, sample_answer: str, reformulated_query: str) -> Optional[str]:
+        """
+        Check cache using BOTH approaches and use the best match:
+        1. Compare reformulated_query with cached questions (query-to-question matching)
+        2. Compare sample_answer with cached answers (answer-to-answer matching, same logic as bert_filter_candidates)
+        
+        Uses reranker for both comparisons. Picks the best match from either approach.
+        If similarity > 0.6, uses LLM to verify and reframe the cached answer.
+        
+        Args:
+            sample_answer: Sample answer text from reformulation LLM (for better semantic matching)
+            reformulated_query: Reformulated query (for query-to-question matching and LLM verification)
+        
+        Returns:
+            Reframed cached answer if match found, None otherwise
+        """
+        if not self.answer_list or not self.question_list:
+            print("[CACHE_SYSTEM] No cache data available")
+            return None
+        
+        global reranker
+        if not reranker:
+            print("[CACHE_SYSTEM] Reranker not available")
+            return None
+        
+        print("="*60)
+        print("CACHE SYSTEM BLOCK")
+        print("="*60)
+        print(f"[CACHE_SYSTEM] Checking cache using BOTH approaches:")
+        print(f"[CACHE_SYSTEM]   1. reformulated_query vs cached_questions (query-to-question)")
+        print(f"[CACHE_SYSTEM]   2. sample_answer vs cached_answers (answer-to-answer)")
+        print(f"[CACHE_SYSTEM] reformulated_query preview: {reformulated_query[:100]}...")
+        print(f"[CACHE_SYSTEM] sample_answer preview: {sample_answer[:200] if sample_answer else '(empty)'}...")
+        
+        cache_start = time.perf_counter()
+        
+        try:
+            best_match_1_idx = None
+            best_match_1_score = 0.0
+            approach_1_attempted = False
+            best_match_2_idx = None
+            best_match_2_score = 0.0
+            approach_2_attempted = False
+            
+            # APPROACH 1: Compare reformulated_query with cached questions
+            print("\n[CACHE_SYSTEM] APPROACH 1: reformulated_query vs cached_questions")
+            if reformulated_query and self.question_list:
+                approach_1_attempted = True
+                question_pairs = []
+                for i, cached_question in enumerate(self.question_list):
+                    if cached_question and len(cached_question.strip()) > 0:
+                        question_pairs.append((reformulated_query, cached_question))
+                
+                if question_pairs:
+                    print(f"[CACHE_SYSTEM] Created {len(question_pairs)} valid question pairs for reranking")
+                    
+                    if hasattr(reranker, "rerank") and FLASHRANK_AVAILABLE:
+                        # FlashRank path - batch rerank (same as Approach 2)
+                        print("[CACHE_SYSTEM] Using FlashRank.rerank path for question matching")
+                        
+                        passages = []
+                        for i, cached_question in enumerate(self.question_list):
+                            if cached_question and len(cached_question.strip()) > 0:
+                                passages.append({"id": f"question_{i}", "text": cached_question})
+                        
+                        if passages:
+                            request = RerankRequest(query=reformulated_query, passages=passages)
+                            ranked = reranker.rerank(request)
+                            
+                            if ranked:
+                                # FlashRank returns: {"id": "...", "score": float} or {"id": "...", "relevance_score": float}
+                                score_field = None
+                                if len(ranked) > 0:
+                                    first_result = ranked[0]
+                                    if isinstance(first_result, dict):
+                                        if "score" in first_result:
+                                            score_field = "score"
+                                        elif "relevance_score" in first_result:
+                                            score_field = "relevance_score"
+                                
+                                if score_field:
+                                    # Create score list aligned with question_list order
+                                    score_map = {}
+                                    for r in ranked:
+                                        r_id = r.get("id")
+                                        r_score = r.get(score_field, 0.0)
+                                        if r_id:
+                                            score_map[r_id] = float(r_score)
+                                    
+                                    scores_q = []
+                                    for i in range(len(self.question_list)):
+                                        question_id = f"question_{i}"
+                                        score_val = score_map.get(question_id, 0.0)
+                                        scores_q.append(score_val)
+                                    
+                                    if scores_q:
+                                        best_match_1_idx = np.argmax(scores_q)
+                                        best_match_1_score = float(scores_q[best_match_1_idx])
+                                        print(f"[CACHE_SYSTEM] Best question match (FlashRank): idx={best_match_1_idx}, score={best_match_1_score:.3f}")
+                    
+                    elif hasattr(reranker, "predict"):
+                        # CrossEncoder path - batch predict
+                        print("[CACHE_SYSTEM] Using CrossEncoder.predict path for question matching")
+                        scores_q = reranker.predict(question_pairs)
+                        
+                        # Handle numpy array or list
+                        if hasattr(scores_q, 'tolist'):
+                            scores_q = scores_q.tolist()
+                        if not isinstance(scores_q, list):
+                            scores_q = list(scores_q) if hasattr(scores_q, '__iter__') else [scores_q]
+                        
+                        if scores_q:
+                            best_match_1_idx = np.argmax(scores_q)
+                            best_match_1_score = float(scores_q[best_match_1_idx])
+                            print(f"[CACHE_SYSTEM] Best question match (CrossEncoder): idx={best_match_1_idx}, score={best_match_1_score:.3f}")
+            
+            # APPROACH 2: Compare sample_answer with cached answers (same logic as bert_filter_candidates)
+            print("\n[CACHE_SYSTEM] APPROACH 2: sample_answer vs cached_answers")
+            if sample_answer and self.answer_list:
+                approach_2_attempted = True
+                # Use sample_answer for comparison
+                comparison_text = sample_answer
+                
+                answer_pairs = []
+                for i, cached_answer in enumerate(self.answer_list):
+                    if cached_answer and len(cached_answer.strip()) > 0:
+                        answer_pairs.append((comparison_text, cached_answer))
+                
+                if answer_pairs:
+                    print(f"[CACHE_SYSTEM] Created {len(answer_pairs)} valid answer pairs for reranking")
+                    
+                    if hasattr(reranker, "rerank") and FLASHRANK_AVAILABLE:
+                        # FlashRank path - batch rerank (same as bert_filter_candidates)
+                        print("[CACHE_SYSTEM] Using FlashRank.rerank path for answer matching")
+                        
+                        # For FlashRank, use reformulated_query if sample_answer is too long
+                        flashrank_query = reformulated_query if len(comparison_text) > 200 else comparison_text
+                        print(f"[CACHE_SYSTEM] Using {'reformulated_query' if len(comparison_text) > 200 else 'sample_answer'} for FlashRank (len={len(flashrank_query)})")
+                        
+                        passages = []
+                        for i, cached_answer in enumerate(self.answer_list):
+                            if cached_answer and len(cached_answer.strip()) > 0:
+                                passages.append({"id": f"cache_{i}", "text": cached_answer})
+                        
+                        if passages:
+                            request = RerankRequest(query=flashrank_query, passages=passages)
+                            ranked = reranker.rerank(request)
+                            
+                            if ranked:
+                                # FlashRank returns: {"id": "...", "score": float} or {"id": "...", "relevance_score": float}
+                                score_field = None
+                                if len(ranked) > 0:
+                                    first_result = ranked[0]
+                                    if isinstance(first_result, dict):
+                                        if "score" in first_result:
+                                            score_field = "score"
+                                        elif "relevance_score" in first_result:
+                                            score_field = "relevance_score"
+                                
+                                if score_field:
+                                    # Create score list aligned with answer_list order
+                                    score_map = {}
+                                    for r in ranked:
+                                        r_id = r.get("id")
+                                        r_score = r.get(score_field, 0.0)
+                                        if r_id:
+                                            score_map[r_id] = float(r_score)
+                                    
+                                    scores_a = []
+                                    for i in range(len(self.answer_list)):
+                                        cache_id = f"cache_{i}"
+                                        score_val = score_map.get(cache_id, 0.0)
+                                        scores_a.append(score_val)
+                                    
+                                    if scores_a:
+                                        best_match_2_idx = np.argmax(scores_a)
+                                        best_match_2_score = float(scores_a[best_match_2_idx])
+                                        print(f"[CACHE_SYSTEM] Best answer match (FlashRank): idx={best_match_2_idx}, score={best_match_2_score:.3f}")
+                    
+                    elif hasattr(reranker, "predict"):
+                        # CrossEncoder path - batch predict (same as bert_filter_candidates)
+                        print("[CACHE_SYSTEM] Using CrossEncoder.predict path for answer matching")
+                        scores_a = reranker.predict(answer_pairs)
+                        
+                        # Handle numpy array or list
+                        if hasattr(scores_a, 'tolist'):
+                            scores_a = scores_a.tolist()
+                        if not isinstance(scores_a, list):
+                            scores_a = list(scores_a) if hasattr(scores_a, '__iter__') else [scores_a]
+                        
+                        if scores_a:
+                            best_match_2_idx = np.argmax(scores_a)
+                            best_match_2_score = float(scores_a[best_match_2_idx])
+                            print(f"[CACHE_SYSTEM] Best answer match (CrossEncoder): idx={best_match_2_idx}, score={best_match_2_score:.3f}")
+            
+            # Check if BOTH approaches meet threshold (both must be >= 0.60)
+            cache_end = time.perf_counter()
+            print(f"\n[CACHE_SYSTEM] Reranker computation took {cache_end - cache_start:.3f} seconds")
+            approach_1_status = f"best_score={best_match_1_score:.3f}, idx={best_match_1_idx}" if approach_1_attempted else "NOT ATTEMPTED (empty reformulated_query or no cached questions)"
+            approach_2_status = f"best_score={best_match_2_score:.3f}, idx={best_match_2_idx}" if approach_2_attempted else "NOT ATTEMPTED (empty sample_answer or no cached answers)"
+            print(f"[CACHE_SYSTEM] Approach 1 (query-to-question): {approach_1_status}")
+            print(f"[CACHE_SYSTEM] Approach 2 (answer-to-answer): {approach_2_status}")
+            
+            # Both checks must be >= 0.60 to use cache
+            # If either approach wasn't attempted or scored below 0.60, proceed to retrieval
+            if approach_1_attempted and approach_2_attempted and best_match_1_score >= 0.60 and best_match_2_score >= 0.60:
+                # Both checks passed - use cache answer
+                # Use the answer-to-answer match (approach 2) as it's more reliable for semantic matching
+                best_idx = best_match_2_idx
+                best_similarity = best_match_2_score
+                
+                print(f"\n[CACHE_SYSTEM] BOTH checks passed threshold 0.60:")
+                print(f"[CACHE_SYSTEM]   Approach 1 (query-to-question): {best_match_1_score:.3f} >= 0.60 ✓")
+                print(f"[CACHE_SYSTEM]   Approach 2 (answer-to-answer): {best_match_2_score:.3f} >= 0.60 ✓")
+                print(f"[CACHE_SYSTEM] Using cached answer at idx={best_idx}")
+                cached_q_preview = self.question_list[best_idx][:100] if best_idx < len(self.question_list) else "(none)"
+                print(f"[CACHE_SYSTEM] Cached question: {cached_q_preview}...")
+                print(f"[CACHE_SYSTEM] Cached answer preview: {self.answer_list[best_idx][:100]}...")
+                
+                # Step 2: Use LLM to verify and reframe the cached answer
+                print(f"[CACHE_SYSTEM] Using LLM to verify and reframe cached answer...")
+                cached_question = self.question_list[best_idx] if best_idx < len(self.question_list) else ""
+                cached_answer = self.answer_list[best_idx]
+                
+                # Use LLM to verify and reframe the cached answer
+                reframed_answer = self._verify_and_reframe_cache(reformulated_query, cached_question, cached_answer)
+                
+                if reframed_answer:
+                    print("[CACHE_SYSTEM] LLM verified and reframed cached answer successfully")
+                    print("="*60)
+                    return reframed_answer
+                else:
+                    print("[CACHE_SYSTEM] LLM determined cached answer cannot answer the query")
+                    print("="*60)
+                    return None
+            else:
+                # At least one check failed or wasn't attempted - proceed to retrieval
+                print(f"\n[CACHE_SYSTEM] At least one check below threshold 0.60 or not attempted - proceeding to retrieval")
+                if approach_1_attempted:
+                    print(f"[CACHE_SYSTEM] Approach 1 (query-to-question): {best_match_1_score:.3f} {'>= 0.60 ✓' if best_match_1_score >= 0.60 else '< 0.60 ✗'}")
+                else:
+                    print(f"[CACHE_SYSTEM] Approach 1 (query-to-question): NOT ATTEMPTED ✗")
+                if approach_2_attempted:
+                    print(f"[CACHE_SYSTEM] Approach 2 (answer-to-answer): {best_match_2_score:.3f} {'>= 0.60 ✓' if best_match_2_score >= 0.60 else '< 0.60 ✗'}")
+                else:
+                    print(f"[CACHE_SYSTEM] Approach 2 (answer-to-answer): NOT ATTEMPTED ✗")
+                print("="*60)
+                return None
+                
+        except Exception as e:
+            print(f"[CACHE_SYSTEM] Error during cache check: {e}")
+            import traceback
+            traceback.print_exc()
+            print("="*60)
+            return None
+    
+    def _verify_and_reframe_cache(self, reformulated_query: str, cached_question: str, cached_answer: str) -> Optional[str]:
+        """Combined verification and reframing: Check if cached answer can answer the query, and reframe if yes"""
+        prompt = f"""You are a medical assistant. Your task is to determine if the provided answer can address the user's query, and if yes, reframe it to directly answer the query.
+
+User Query: {reformulated_query}
+
+Original Question (for reference): {cached_question}
+
+Provided Answer: {cached_answer}
+
+CRITICAL INSTRUCTIONS:
+
+• VERIFICATION STEP:
+  - Determine if the provided answer contains information that can answer the user query
+  - If YES: Proceed to reframing
+  - If NO: Return exactly "NULL" (nothing else)
+
+• REFRAMING RULES (if applicable):
+  - Use ONLY information from the provided answer - NO external knowledge
+  - Maintain ALL medical facts exactly as they appear in the provided answer
+  - Adjust tense, flow, and structure to directly match the user query
+  - Do NOT add any external information not present in the provided answer
+  - Do NOT remove any medical information from the provided answer
+  - Keep the answer concise and directly relevant to the query
+
+• RESPONSE FORMAT REQUIREMENTS (CRITICAL):
+  - Provide ONLY the reframed answer - nothing else
+  - Do NOT mention "cache", "cached response", "cached answer", or any similar terms
+  - Do NOT add prefixes like "The following question can be answered from...", "Based on cached response...", etc.
+  - Do NOT add any metadata, explanations, or disclaimers about the source
+  - Answer as if you are directly responding to the user's query naturally
+  - Start directly with the answer content
+
+EXAMPLES OF DO'S AND DON'TS:
+
+DON'T (WRONG):
+❌ "The following question can be answered from cached response: Fever is caused by..."
+❌ "Based on the cached answer, fever is caused by..."
+❌ "This can be answered from cache: Fever is caused by..."
+❌ "Cached response: Fever is caused by..."
+
+DO (CORRECT):
+✅ "Fever is caused by infections, inflammatory conditions, and certain medications..."
+✅ "Jaundice treatment includes addressing the underlying cause, which may involve..."
+✅ "Signs of dehydration include dry mouth, decreased urine output, fatigue..."
+
+VERIFICATION EXAMPLES:
+- Query: "What causes fever?" + Answer: "Fever symptoms include..." → NULL (no cause info)
+- Query: "What causes fever?" + Answer: "Fever is caused by infections..." → Reframe to focus on causes
+- Query: "How to treat jaundice?" + Answer: "Jaundice symptoms are..." → NULL (no treatment info)
+- Query: "What are signs of dehydration?" + Answer: "Dehydration signs include..." → Reframe to focus on signs
+
+Response: Return ONLY the reframed answer (with no cache mentions) if applicable, or exactly "NULL" if not applicable."""
+
+        try:
+            response = gemini_llm.invoke([HumanMessage(content=prompt)]).content.strip()
+            print(f"[CACHE_SYSTEM] LLM response preview: {response[:200]}...")
+            
+            # Check if LLM returned NULL
+            if response.upper().strip() == "NULL":
+                print(f"[CACHE_SYSTEM] LLM determined cached answer cannot answer the query")
+                return None
+            
+            # Return the reframed answer
+            print(f"[CACHE_SYSTEM] LLM provided reframed answer")
+            return response
+            
+        except Exception as e:
+            print(f"[CACHE_SYSTEM] Combined verification and reframing failed: {e}")
+            # Fallback: return None to trigger RAG pipeline
+            print(f"[CACHE_SYSTEM] Falling back to RAG pipeline")
+            return None
+
+# -------------------- MAIN PIPELINE (called by API) --------------------
+async def medical_pipeline_api(user_id: str, user_message: str, background_tasks: BackgroundTasks) -> Dict[str, Any]:
+    print(f"[pipeline] Start user_id={user_id}, message={user_message[:50]}")
+    timer = CheckpointTimer("medical_pipeline_api")
+    start_time = time.perf_counter()
+
+    history_pairs, current_summary = await get_history(user_id)
+    t1 = time.perf_counter()
+    timer.mark("get_history")
+    print(f"history fetch took {t1 - start_time:.2f} secs")
+    print(f"[pipeline] History pairs={len(history_pairs)} summary_len={len(current_summary)}")
+    
+    # We need to reconstruct the chat_history for the LLM prompts
+    chat_history_context_for_llm, last_3_qa_pairs = get_chat_context(history_pairs, current_summary)
+    t2 = time.perf_counter()
+    timer.mark("get_chat_context")
+    print(f"chat context build took {t2 - t1:.2f} secs")
+    print(f"[pipeline] chat_context_len={len(chat_history_context_for_llm)}")
+    print(f"[pipeline] last_3_qa_pairs={last_3_qa_pairs[:200] if last_3_qa_pairs else '(none)'}")
+    
+    # Combined classification + reformulation using Gemini (OPTIMIZED: Single LLM call instead of two)
+    print("\n" + "="*80)
+    print("STEP 1+2: CLASSIFICATION + REFORMULATION (GEMINI OPTIMIZED)")
+    print("="*80)
+    print(f"[PIPELINE] Starting classify_and_reformulate for: {user_message[:50]}...")
+    
+    label, reason, rewritten, correction, sample_answer = classify_and_reformulate(chat_history_context_for_llm, user_message, last_3_qa_pairs)
+    t3 = time.perf_counter()
+    
+    print(f"[PIPELINE] classify_and_reformulate took {t3 - t2:.2f} secs")
+    print(f"[PIPELINE] FINAL RESULTS:")
+    print(f"  Classification: {label}")
+    print(f"  Reason: {reason}")
+    print(f"  Rewritten Query: {rewritten}")
+    print(f"  Corrections: {correction}")
+    print("="*80)
+
+    # If classifier says CHITCHAT, short-circuit: call chitchat LLM and return immediately
+    # Use ORIGINAL user_message, NOT the rewritten version
+    if isinstance(label, str) and label.strip().upper() == "CHITCHAT":
+        print("[pipeline] CHITCHAT detected -> chitchat handler")
+        print(f"[pipeline] Using ORIGINAL message for chitchat: {user_message}")
+        reply = handle_chitchat(user_message, chat_history_context_for_llm)
+        # Do not update or save chitchat history per request
+        t_end = time.perf_counter()
+        total_time = t_end - start_time
+        timer.total("request")
+        print(f"total took {total_time:.2f} secs")
+        return {"answer": reply, "intent": "chitchat", "follow_up": None, "total_time": round(total_time, 3)}
+
+    # Skip the old reformulation step since it's now combined above
+
+    # ---- HYBRID RETRIEVAL ----
+    print("[pipeline] Step 4: hybrid_retrieve")
+    candidates = hybrid_retrieve(rewritten)   # vector + bm25 + rerank
+    t4 = time.perf_counter()
+    timer.mark("hybrid_retrieve")
+    print(f"retrieval took {t4 - t3:.2f} secs")
+    print(f"[pipeline] retrieved {len(candidates)} candidates")
+
+    # Edge case: No candidates retrieved
+    if not candidates or len(candidates) == 0:
+        print("[pipeline] No candidates retrieved from hybrid_retrieve")
+        msg = "Sorry I am not aware this topic, Please ask any other medical related terminologies"
+        background_tasks.add_task(_background_update_and_save, user_id, user_message, msg, "no_context", history_pairs, current_summary)
+        t_end = time.perf_counter()
+        total_time = t_end - start_time
+        timer.total("request")
+        print(f"total took {total_time:.2f} secs")
+        return {"answer": msg, "intent": "no_context", "follow_up": None, "video_url": None, "total_time": round(total_time, 3)}
+
+    print("[pipeline] Step 5: bert_filter_candidates")
+    # Use sample_answer for better semantic matching (answer-to-answer comparison)
+    filtered = bert_filter_candidates(candidates, sample_answer, rewritten, min_score=0.35)
+    t5 = time.perf_counter()
+    timer.mark("bert_filter_candidates")
+    print(f"BERT filtering took {t5 - t4:.2f} secs")
+    print(f"[pipeline] BERT filter -> answers={len(filtered)}")
+
+    # ---- BERT FILTER → SYNTHESIZE ----
+    if filtered:
+        top4 = filtered
+
+        print("[pipeline] Step 6: synthesize_answer")
+        answer = synthesize_answer(rewritten, top4, gemini_llm)
+        t6 = time.perf_counter()
+        timer.mark("synthesize_answer")
+        print(f"synthesis took {t6 - t5:.2f} secs")
+
+        # Apply correction prefix if needed
+        if label != "FOLLOW_UP" and correction:
+            correction_msg = f"I guess you meant: \"{rewritten}\""
+            answer = correction_msg + "\n" + answer
+        
+        # Find relevant video URL
+        print("[pipeline] Step 7: Finding relevant video...")
+        video_url = None
+        if video_system:
+            video_start = time.perf_counter()
+            video_url = video_system.find_relevant_video(answer)
+            video_end = time.perf_counter()
+            print(f"[pipeline] Video matching took {video_end - video_start:.3f} secs")
+            if video_url:
+                print(f"[pipeline] Found relevant video: {video_url}")
+            else:
+                print("[pipeline] No relevant video found")
+        
+        # Schedule full update+save in background (do not run update_chat_history in request path)
+        print("[pipeline] schedule background save: answer")
+        background_tasks.add_task(_background_update_and_save, user_id, user_message, answer, "answer", history_pairs, current_summary)
+        print("[pipeline] done with answer")
+        t_end = time.perf_counter()
+        total_time = t_end - start_time
+        timer.total("request")
+        print(f"total took {total_time:.2f} secs")
+        
+        # Return response with video URL
+        response = {"answer": answer, "intent": "answer", "total_time": round(total_time, 3)}
+        if video_url:
+            response["video_url"] = video_url
+        else:
+            response["video_url"] = None
+        
+        return response
+
+    else:
+        # Edge case: No qualified chunks found
+        print("[pipeline] No qualified chunks found (all candidates below threshold or empty)")
+        msg = "Sorry I am not aware this topic, Please ask any other medical related terminologies"
+        # Schedule full update+save in background for no_context
+        print("[pipeline] schedule background save: no_context")
+        background_tasks.add_task(_background_update_and_save, user_id, user_message, msg, "no_context", history_pairs, current_summary)
+        print("[pipeline] done with no_context")
+        t_end = time.perf_counter()
+        total_time = t_end - start_time
+        timer.total("request")
+        print(f"total took {total_time:.2f} secs")
+        
+        # Return response with video URL (None for no_context)
+        return {"answer": msg, "intent": "no_context", "follow_up": None, "video_url": None, "total_time": round(total_time, 3)}
+
+async def medical_pipeline_api_stream(user_id: str, user_message: str, background_tasks: BackgroundTasks):
+    """
+    Streaming version of medical_pipeline_api that yields SSE events.
+    Returns an async generator that yields formatted SSE data.
+    """
+    timer = CheckpointTimer("medical_pipeline_api_stream")
+    start_time = time.perf_counter()
+    print(f"\n{'='*80}")
+    print(f"[STREAM] Starting streaming pipeline for user_id={user_id}, message={user_message[:50]}...")
+    print(f"[STREAM] Start time: {start_time:.3f}")
+    print(f"{'='*80}")
+
+    try:
+        history_pairs, current_summary = await get_history(user_id)
+        t1 = time.perf_counter()
+        timer.mark("get_history")
+        print(f"[STREAM] get_history took {t1 - start_time:.3f} secs")
+        
+        chat_history_context_for_llm, last_3_qa_pairs = get_chat_context(history_pairs, current_summary)
+        t2 = time.perf_counter()
+        timer.mark("get_chat_context")
+        print(f"[STREAM] get_chat_context took {t2 - t1:.3f} secs")
+        
+        # Combined classification + reformulation
+        print(f"[STREAM] Starting classification + reformulation...")
+        label, reason, rewritten, correction, sample_answer = classify_and_reformulate(
+            chat_history_context_for_llm, user_message, last_3_qa_pairs
+        )
+        t3 = time.perf_counter()
+        timer.mark("classify_and_reformulate")
+        print(f"[STREAM] classify_and_reformulate took {t3 - t2:.3f} secs")
+
+        # Handle chitchat - send full response immediately
+        if isinstance(label, str) and label.strip().upper() == "CHITCHAT":
+            print(f"[STREAM] CHITCHAT detected, handling...")
+            reply = handle_chitchat(user_message, chat_history_context_for_llm)
+            await save_history(user_id, user_message, reply, "chitchat", current_summary)
+            
+            preprocessing_time = time.perf_counter() - start_time
+            print(f"[STREAM] Preprocessing completed in {preprocessing_time:.3f} secs")
+            print(f"[STREAM] Starting to stream tokens NOW...")
+            
+            # Stream chitchat response word by word for better UX
+            words = reply.split()
+            for i, word in enumerate(words):
+                if i == 0:
+                    # Calculate time from request start to when first token is yielded
+                    time_to_first_token = time.perf_counter() - start_time
+                    print(f"[STREAM] First token yielded to client! Time to first token (from request start): {time_to_first_token:.3f} secs")
+                yield f"data: {json.dumps({'type': 'token', 'content': word + ' '})}\n\n"
+                await asyncio.sleep(0.01)  # Small delay for smooth streaming
+            
+            yield f"data: {json.dumps({'type': 'metadata', 'intent': 'chitchat', 'follow_up': None, 'video_url': None, 'total_time': round(time.perf_counter() - start_time, 3)})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+        # Hybrid retrieval
+        print(f"[STREAM] Starting hybrid retrieval...")
+        retrieval_start = time.perf_counter()
+        candidates = hybrid_retrieve(rewritten)
+        retrieval_end = time.perf_counter()
+        timer.mark("hybrid_retrieve")
+        print(f"[STREAM] hybrid_retrieve took {retrieval_end - retrieval_start:.3f} secs")
+        print(f"[STREAM] Retrieved {len(candidates)} candidates")
+        
+        if not candidates:
+            msg = "I apologize, but I do not have sufficient information in my documents to answer this question accurately."
+            # Stream no_context message word by word
+            words = msg.split()
+            for word in words:
+                yield f"data: {json.dumps({'type': 'token', 'content': word + ' '})}\n\n"
+                await asyncio.sleep(0.01)
+            
+            background_tasks.add_task(_background_update_and_save, user_id, user_message, msg, "no_context", history_pairs, current_summary)
+            yield f"data: {json.dumps({'type': 'metadata', 'intent': 'no_context', 'follow_up': None, 'video_url': None, 'total_time': round(time.perf_counter() - start_time, 3)})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+        # Filter candidates
+        print(f"[STREAM] Starting BERT filter...")
+        filter_start = time.perf_counter()
+        filtered = bert_filter_candidates(candidates, sample_answer, rewritten, min_score=0.35)
+        filter_end = time.perf_counter()
+        timer.mark("bert_filter_candidates")
+        print(f"[STREAM] bert_filter_candidates took {filter_end - filter_start:.3f} secs")
+        print(f"[STREAM] Filtered to {len(filtered)} answer chunks")
+
+        if not filtered:
+            msg = "I apologize, but I do not have sufficient information in my documents to answer this question accurately."
+            # Stream no_context message word by word
+            words = msg.split()
+            for word in words:
+                yield f"data: {json.dumps({'type': 'token', 'content': word + ' '})}\n\n"
+                await asyncio.sleep(0.01)
+            
+            background_tasks.add_task(_background_update_and_save, user_id, user_message, msg, "no_context", history_pairs, current_summary)
+            yield f"data: {json.dumps({'type': 'metadata', 'intent': 'no_context', 'follow_up': None, 'video_url': None, 'total_time': round(time.perf_counter() - start_time, 3)})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+        # Get top chunks
+        top4 = filtered
+
+        # Apply correction prefix if needed (stream it first)
+        if label != "FOLLOW_UP" and correction:
+            correction_msg = f"I guess you meant: \"{rewritten}\"\n"
+            words = correction_msg.split()
+            for word in words:
+                yield f"data: {json.dumps({'type': 'token', 'content': word + ' '})}\n\n"
+                await asyncio.sleep(0.01)
+
+        # Stream answer tokens
+        preprocessing_time = time.perf_counter() - start_time
+        print(f"[STREAM] Preprocessing completed in {preprocessing_time:.3f} secs")
+        print(f"[STREAM] Starting to stream LLM tokens NOW...")
+        token_count = 0
+        
+        full_answer = ""
+        async for token_chunk in synthesize_answer_stream(rewritten, top4, gemini_llm):
+            if token_count == 0:
+                # Calculate time from request start to when first token is yielded to client
+                time_to_first_token = time.perf_counter() - start_time
+                print(f"[STREAM] First token yielded to client! Time to first token (from request start): {time_to_first_token:.3f} secs")
+            token_count += 1
+            full_answer += token_chunk
+            yield f"data: {json.dumps({'type': 'token', 'content': token_chunk})}\n\n"
+        
+        if token_count > 0:
+            print(f"[STREAM] Streamed {token_count} token chunks")
+
+        # Add correction prefix to full_answer for saving
+        if label != "FOLLOW_UP" and correction:
+            correction_msg = f"I guess you meant: \"{rewritten}\"\n"
+            full_answer = correction_msg + full_answer
+
+        # Find video URL
+        video_url = None
+        if video_system:
+            video_url = video_system.find_relevant_video(full_answer)
+
+        # Schedule background save
+        background_tasks.add_task(_background_update_and_save, user_id, user_message, full_answer, "answer", history_pairs, current_summary)
+
+        # Send metadata
+        total_time = time.perf_counter() - start_time
+        print(f"[STREAM] Streaming completed! Total time: {total_time:.3f} secs")
+        print(f"[STREAM] Preprocessing: {preprocessing_time:.3f} secs, Streaming: {total_time - preprocessing_time:.3f} secs")
+        timer.total("request")
+        print(f"{'='*80}\n")
+        
+        yield f"data: {json.dumps({'type': 'metadata', 'intent': 'answer', 'video_url': video_url, 'total_time': round(total_time, 3)})}\n\n"
+        yield "data: [DONE]\n\n"
+
+    except Exception as e:
+        print(f"[medical_pipeline_api_stream] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        error_msg = f"Internal server error: {str(e)}"
+        yield f"data: {json.dumps({'type': 'error', 'message': error_msg})}\n\n"
+        yield "data: [DONE]\n\n"
+
+
+# -------------------- API ENDPOINTS --------------------
+@app.on_event("startup")
+async def startup_event():
+    global embedding_model, reranker, chromadb_collection, llm, summarizer_llm, reformulate_llm, classifier_llm, gemini_llm, EMBED_DIM, video_system
+    print("[startup] Initializing models and ChromaDB client...")
+    t = CheckpointTimer("startup")
+    embedding_model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
+    t.mark("load_embedding_model")
+    EMBED_DIM = embedding_model.get_sentence_embedding_dimension()
+    # Use a lightweight ONNX/distilled reranker (FlashRank) for low-latency re-ranking
+    try:
+        reranker = Ranker(model_name="ms-marco-TinyBERT-L-2-v2")
+        t.mark("load_reranker")
+    except Exception:
+        # Fallback to CrossEncoder if flashrank is not available
+        reranker = CrossEncoder(CROSS_ENCODER_MODEL)
+        t.mark("load_reranker_fallback")
+
+    # Initialize ChromaDB
+    if not CHROMADB_AVAILABLE:
+        raise RuntimeError("ChromaDB not available. Install with: pip install chromadb")
+    
+    # Path resolution: script is in FASTAPI-DEPLOYMENT/, but FILES/ is at project root
+    # Go up one level from script location, then into FILES/local_vectorstore
+    script_dir = Path(__file__).parent  # FASTAPI-DEPLOYMENT/
+    project_root = script_dir.parent    # RHL-FASTAPI/
+    VECTORSTORE_DIR = project_root / "FILES" / "local_vectorstore"
+    
+    # Also try relative path (if running from project root)
+    if not VECTORSTORE_DIR.exists():
+        VECTORSTORE_DIR = Path("FILES/local_vectorstore")
+    
+    if not VECTORSTORE_DIR.exists():
+        print(f"[startup] WARNING: ChromaDB not found at {VECTORSTORE_DIR}")
+        print(f"[startup] Tried absolute path: {project_root / 'FILES' / 'local_vectorstore'}")
+        print(f"[startup] Tried relative path: FILES/local_vectorstore")
+        print("[startup] Please run setup_local_vectorstore.py first to create the vector store")
+        raise RuntimeError("ChromaDB vector store not found. Run setup_local_vectorstore.py first.")
+    
+    client = chromadb.PersistentClient(
+        path=str(VECTORSTORE_DIR),
+        settings=Settings(anonymized_telemetry=False)
+    )
+    t.mark("init_chromadb_client")
+    
+    try:
+        chromadb_collection = client.get_collection(name="medical_documents")
+        collection_count = chromadb_collection.count()
+        if collection_count == 0:
+            print(f"[startup] WARNING: ChromaDB collection loaded but is EMPTY ({collection_count} chunks)")
+            print("[startup] Please run setup_local_vectorstore.py to populate the collection")
+        else:
+            print(f"[startup] ChromaDB collection loaded successfully with {collection_count} chunks")
+        
+        # Verify collection has the expected structure
+        try:
+            # Try a dummy query to verify collection is functional
+            test_embedding = [0.0] * EMBED_DIM
+            test_results = chromadb_collection.query(
+                query_embeddings=[test_embedding],
+                n_results=1
+            )
+            print(f"[startup] ChromaDB collection verified and ready")
+        except Exception as e:
+            print(f"[startup] WARNING: ChromaDB collection verification failed: {e}")
+            print("[startup] Collection may not be properly initialized")
+    except Exception as e:
+        print(f"[startup] ERROR: Could not load ChromaDB collection: {e}")
+        print("[startup] Please run setup_local_vectorstore.py first to create the vector store")
+        raise RuntimeError(f"ChromaDB collection not found: {e}")
+    
+    t.mark("chromadb_collection_ready")
+
+    # Initialize OpenAI models
+    llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0.0, api_key=OPENAI_API_KEY)
+    # chitchat_llm removed - now using Gemini for chitchat
+    summarizer_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0, api_key=OPENAI_API_KEY)
+    reformulate_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0, api_key=OPENAI_API_KEY)
+    classifier_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0, api_key=OPENAI_API_KEY)
+    
+    # Initialize Gemini for ALL LLM tasks (classification, reformulation, judging, synthesis, chitchat)
+    # Set temperature=0.0 for reproducible outputs
+    gemini_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", api_key=GOOGLE_API_KEY, temperature=0.0)
+    t.mark("init_llms")
+
+    # Initialize video matching system
+    print("[startup] Initializing video matching system...")
+    video_system = VideoMatchingSystem()
+    t.mark("init_video_system")
+
+    await init_db()
+    t.mark("init_db")
+    print("[startup] FastAPI application startup complete.")
+
+@app.get("/test-debug")
+async def test_debug_endpoint():
+    """Test endpoint to verify debug statements are working"""
+    print("="*60)
+    print("TEST DEBUG ENDPOINT CALLED")
+    print("="*60)
+    return {"status": "debug_test_working", "message": "Check server console for debug output"}
+
+@app.get("/chat-history")
+async def get_chat_history(
+    user_id: Optional[str] = Query(None, description="Filter by user ID"),
+    start_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
+    limit: Optional[int] = Query(1000, description="Maximum number of records to return")
+) -> List[Dict[str, Any]]:
+    """
+    Get chat history with optional filters.
+    This endpoint is used by the Streamlit viewer app to access data from separate VM.
+    """
+    try:
+        query = "SELECT id, user_id, question, answer, intent, summary, timestamp FROM chat_history WHERE 1=1"
+        params = []
+        
+        if user_id:
+            query += " AND user_id = ?"
+            params.append(user_id)
+        
+        if start_date:
+            query += " AND timestamp >= ?"
+            params.append(f"{start_date} 00:00:00")
+        
+        if end_date:
+            query += " AND timestamp <= ?"
+            params.append(f"{end_date} 23:59:59")
+        
+        query += " ORDER BY timestamp DESC LIMIT ?"
+        params.append(limit)
+        
+        async with aiosqlite.connect("chat_history.db") as db:
+            cursor = await db.execute(query, params)
+            rows = await cursor.fetchall()
+            
+            columns = ['id', 'user_id', 'question', 'answer', 'intent', 'summary', 'timestamp']
+            results = []
+            for row in rows:
+                result = {col: row[i] for i, col in enumerate(columns)}
+                results.append(result)
+            
+            return results
+    
+    except Exception as e:
+        print(f"[chat-history endpoint] Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+@app.get("/chat")
+async def chat_endpoint(
+    user_id: str = Query(..., description="Unique identifier for the user"),
+    message: str = Query(..., description="The user's message or query"),
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
+    try:
+        response = await medical_pipeline_api(user_id, message, background_tasks)
+        return response
+    except Exception as e:
+        print(f"[chat_endpoint] Error for user {user_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
+
+@app.get("/chat-stream")
+async def chat_stream_endpoint(
+    user_id: str = Query(..., description="Unique identifier for the user"),
+    message: str = Query(..., description="The user's message or query"),
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
+    """
+    Streaming endpoint that returns Server-Sent Events (SSE) format.
+    Each event contains either a token or metadata.
+    Format: data: {"type": "token|metadata|error", ...}\n\n
+    """
+    async def generate():
+        async for event in medical_pipeline_api_stream(user_id, message, background_tasks):
+            yield event
+    
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+@app.websocket("/chat-ws")
+async def chat_websocket_endpoint(websocket: WebSocket):
+    """
+    WebSocket endpoint for streaming chat responses.
+    Client sends: {"user_id": "...", "message": "..."}
+    Server sends: {"type": "token|metadata|error", "content": "..."} or {"type": "metadata", ...}
+    """
+    await websocket.accept()
+    print(f"[WEBSOCKET] Client connected: {websocket.client}")
+    
+    try:
+        # Receive initial message with user_id and message
+        data = await websocket.receive_json()
+        user_id = data.get("user_id", "default_user")
+        user_message = data.get("message", "")
+        
+        print(f"[WEBSOCKET] Received: user_id={user_id}, message={user_message[:50]}...")
+        
+        # Create background tasks container
+        class BackgroundTasksContainer:
+            def __init__(self):
+                self.tasks = []
+            def add_task(self, func, *args, **kwargs):
+                self.tasks.append((func, args, kwargs))
+        
+        background_tasks = BackgroundTasksContainer()
+        
+        # Run streaming pipeline
+        async for event in medical_pipeline_api_stream(user_id, user_message, background_tasks):
+            # Parse SSE format to extract JSON
+            if event.startswith("data: "):
+                event_data = event[6:].strip()  # Remove "data: " prefix
+                
+                if event_data == "[DONE]":
+                    await websocket.send_json({"type": "done"})
+                    break
+                
+                try:
+                    # Parse JSON from SSE format
+                    json_data = json.loads(event_data)
+                    # Send as WebSocket JSON message
+                    await websocket.send_json(json_data)
+                except json.JSONDecodeError:
+                    continue
+        
+        # Execute background tasks manually (similar to streamlit_standalone)
+        if background_tasks.tasks:
+            print("[WEBSOCKET] Executing background tasks...")
+            for task_func, task_args, task_kwargs in background_tasks.tasks:
+                try:
+                    if task_kwargs:
+                        await task_func(*task_args, **task_kwargs)
+                    else:
+                        await task_func(*task_args)
+                except Exception as e:
+                    print(f"[WEBSOCKET] Error executing background task: {e}")
+        
+        print(f"[WEBSOCKET] Stream completed, closing connection")
+        
+    except WebSocketDisconnect:
+        print(f"[WEBSOCKET] Client disconnected")
+    except Exception as e:
+        print(f"[WEBSOCKET] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            await websocket.send_json({"type": "error", "message": str(e)})
+        except:
+            pass
+    finally:
+        try:
+            await websocket.close()
+        except:
+            pass
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

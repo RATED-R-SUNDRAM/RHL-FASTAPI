@@ -2770,13 +2770,14 @@ async def medical_pipeline_api(user_id: str, user_message: str, background_tasks
     if isinstance(label, str) and label.strip().upper() == "CHITCHAT":
         print("[pipeline] CHITCHAT detected -> chitchat handler")
         print(f"[pipeline] Using ORIGINAL message for chitchat: {user_message}")
+        preprocessing_time = t3 - start_time  # Time until chitchat handler starts
         reply = handle_chitchat(user_message, chat_history_context_for_llm)
         # Do not update or save chitchat history per request
         t_end = time.perf_counter()
         total_time = t_end - start_time
         timer.total("request")
         print(f"total took {total_time:.2f} secs")
-        return {"answer": reply, "intent": "chitchat", "follow_up": None, "total_time": round(total_time, 3)}
+        return {"answer": reply, "intent": "chitchat", "follow_up": None, "time_to_first_token": round(preprocessing_time, 3), "total_time": round(total_time, 3)}
 
     # Skip the old reformulation step since it's now combined above
 
@@ -2792,12 +2793,13 @@ async def medical_pipeline_api(user_id: str, user_message: str, background_tasks
     if not candidates or len(candidates) == 0:
         print("[pipeline] No candidates retrieved from hybrid_retrieve")
         msg = "Sorry I am not aware this topic, Please ask any other medical related terminologies"
+        preprocessing_time = t4 - start_time  # Time until retrieval completes (no answer generated)
         background_tasks.add_task(_background_update_and_save, user_id, user_message, msg, "no_context", history_pairs, current_summary)
         t_end = time.perf_counter()
         total_time = t_end - start_time
         timer.total("request")
         print(f"total took {total_time:.2f} secs")
-        return {"answer": msg, "intent": "no_context", "follow_up": None, "video_url": None, "total_time": round(total_time, 3)}
+        return {"answer": msg, "intent": "no_context", "follow_up": None, "video_url": None, "time_to_first_token": round(preprocessing_time, 3), "total_time": round(total_time, 3)}
 
     print("[pipeline] Step 5: bert_filter_candidates")
     # Use sample_answer for better semantic matching (answer-to-answer comparison)
@@ -2812,6 +2814,7 @@ async def medical_pipeline_api(user_id: str, user_message: str, background_tasks
         top4 = filtered
 
         print("[pipeline] Step 6: synthesize_answer")
+        time_to_first_token = t5 - start_time  # Time until synthesis starts (preprocessing complete)
         answer = synthesize_answer(rewritten, top4, gemini_llm)
         t6 = time.perf_counter()
         timer.mark("synthesize_answer")
@@ -2843,9 +2846,10 @@ async def medical_pipeline_api(user_id: str, user_message: str, background_tasks
         total_time = t_end - start_time
         timer.total("request")
         print(f"total took {total_time:.2f} secs")
+        print(f"time to first token (preprocessing): {time_to_first_token:.2f} secs")
         
         # Return response with video URL
-        response = {"answer": answer, "intent": "answer", "total_time": round(total_time, 3)}
+        response = {"answer": answer, "intent": "answer", "time_to_first_token": round(time_to_first_token, 3), "total_time": round(total_time, 3)}
         if video_url:
             response["video_url"] = video_url
         else:
@@ -2857,6 +2861,7 @@ async def medical_pipeline_api(user_id: str, user_message: str, background_tasks
         # Edge case: No qualified chunks found
         print("[pipeline] No qualified chunks found (all candidates below threshold or empty)")
         msg = "Sorry I am not aware this topic, Please ask any other medical related terminologies"
+        preprocessing_time = t5 - start_time  # Time until filtering completes (no answer generated)
         # Schedule full update+save in background for no_context
         print("[pipeline] schedule background save: no_context")
         background_tasks.add_task(_background_update_and_save, user_id, user_message, msg, "no_context", history_pairs, current_summary)
@@ -2867,7 +2872,7 @@ async def medical_pipeline_api(user_id: str, user_message: str, background_tasks
         print(f"total took {total_time:.2f} secs")
         
         # Return response with video URL (None for no_context)
-        return {"answer": msg, "intent": "no_context", "follow_up": None, "video_url": None, "total_time": round(total_time, 3)}
+        return {"answer": msg, "intent": "no_context", "follow_up": None, "video_url": None, "time_to_first_token": round(preprocessing_time, 3), "total_time": round(total_time, 3)}
 
 async def medical_pipeline_api_stream(user_id: str, user_message: str, background_tasks: BackgroundTasks):
     """
@@ -2882,6 +2887,8 @@ async def medical_pipeline_api_stream(user_id: str, user_message: str, backgroun
     print(f"{'='*80}")
 
     try:
+        time_to_first_token = None  # Track time to first token
+        
         history_pairs, current_summary = await get_history(user_id)
         t1 = time.perf_counter()
         timer.mark("get_history")
@@ -2921,7 +2928,21 @@ async def medical_pipeline_api_stream(user_id: str, user_message: str, backgroun
                 yield f"data: {json.dumps({'type': 'token', 'content': word + ' '})}\n\n"
                 await asyncio.sleep(0.01)  # Small delay for smooth streaming
             
-            yield f"data: {json.dumps({'type': 'metadata', 'intent': 'chitchat', 'follow_up': None, 'video_url': None, 'total_time': round(time.perf_counter() - start_time, 3)})}\n\n"
+            total_time = time.perf_counter() - start_time
+            # Ensure time_to_first_token is always set (fallback to preprocessing_time if somehow not set)
+            if time_to_first_token is None:
+                time_to_first_token = preprocessing_time
+            time_to_first_token_value = round(time_to_first_token, 3) if time_to_first_token is not None else round(preprocessing_time, 3)
+            
+            metadata_dict = {
+                'type': 'metadata',
+                'intent': 'chitchat',
+                'follow_up': None,
+                'video_url': None,
+                'time_to_first_token': time_to_first_token_value,
+                'total_time': round(total_time, 3)
+            }
+            yield f"data: {json.dumps(metadata_dict)}\n\n"
             yield "data: [DONE]\n\n"
             return
 
@@ -2938,12 +2959,30 @@ async def medical_pipeline_api_stream(user_id: str, user_message: str, backgroun
             msg = "I apologize, but I do not have sufficient information in my documents to answer this question accurately."
             # Stream no_context message word by word
             words = msg.split()
-            for word in words:
+            time_to_first_token = None
+            for i, word in enumerate(words):
+                if i == 0:
+                    time_to_first_token = time.perf_counter() - start_time
+                    print(f"[STREAM] First token yielded to client! Time to first token (from request start): {time_to_first_token:.3f} secs")
                 yield f"data: {json.dumps({'type': 'token', 'content': word + ' '})}\n\n"
                 await asyncio.sleep(0.01)
             
+            total_time = time.perf_counter() - start_time
+            # Ensure time_to_first_token is always set (fallback to t3 - start_time if somehow not set)
+            if time_to_first_token is None:
+                time_to_first_token = t3 - start_time  # Use time after preprocessing
+            time_to_first_token_value = round(time_to_first_token, 3) if time_to_first_token is not None else round(t3 - start_time, 3)
+            
+            metadata_dict = {
+                'type': 'metadata',
+                'intent': 'no_context',
+                'follow_up': None,
+                'video_url': None,
+                'time_to_first_token': time_to_first_token_value,
+                'total_time': round(total_time, 3)
+            }
             background_tasks.add_task(_background_update_and_save, user_id, user_message, msg, "no_context", history_pairs, current_summary)
-            yield f"data: {json.dumps({'type': 'metadata', 'intent': 'no_context', 'follow_up': None, 'video_url': None, 'total_time': round(time.perf_counter() - start_time, 3)})}\n\n"
+            yield f"data: {json.dumps(metadata_dict)}\n\n"
             yield "data: [DONE]\n\n"
             return
 
@@ -2960,12 +2999,31 @@ async def medical_pipeline_api_stream(user_id: str, user_message: str, backgroun
             msg = "I apologize, but I do not have sufficient information in my documents to answer this question accurately."
             # Stream no_context message word by word
             words = msg.split()
-            for word in words:
+            time_to_first_token = None
+            for i, word in enumerate(words):
+                if i == 0:
+                    time_to_first_token = time.perf_counter() - start_time
+                    print(f"[STREAM] First token yielded to client! Time to first token (from request start): {time_to_first_token:.3f} secs")
                 yield f"data: {json.dumps({'type': 'token', 'content': word + ' '})}\n\n"
                 await asyncio.sleep(0.01)
             
+            total_time = time.perf_counter() - start_time
+            # Ensure time_to_first_token is always set (fallback to time after filtering if somehow not set)
+            if time_to_first_token is None:
+                # Use time after retrieval and filtering completed (filter_end is defined above)
+                time_to_first_token = filter_end - start_time
+            time_to_first_token_value = round(time_to_first_token, 3) if time_to_first_token is not None else round(filter_end - start_time, 3)
+            
+            metadata_dict = {
+                'type': 'metadata',
+                'intent': 'no_context',
+                'follow_up': None,
+                'video_url': None,
+                'time_to_first_token': time_to_first_token_value,
+                'total_time': round(total_time, 3)
+            }
             background_tasks.add_task(_background_update_and_save, user_id, user_message, msg, "no_context", history_pairs, current_summary)
-            yield f"data: {json.dumps({'type': 'metadata', 'intent': 'no_context', 'follow_up': None, 'video_url': None, 'total_time': round(time.perf_counter() - start_time, 3)})}\n\n"
+            yield f"data: {json.dumps(metadata_dict)}\n\n"
             yield "data: [DONE]\n\n"
             return
 
@@ -2976,7 +3034,11 @@ async def medical_pipeline_api_stream(user_id: str, user_message: str, backgroun
         if label != "FOLLOW_UP" and correction:
             correction_msg = f"I guess you meant: \"{rewritten}\"\n"
             words = correction_msg.split()
-            for word in words:
+            for i, word in enumerate(words):
+                if i == 0 and time_to_first_token is None:
+                    # First token is from correction prefix
+                    time_to_first_token = time.perf_counter() - start_time
+                    print(f"[STREAM] First token (correction) yielded to client! Time to first token: {time_to_first_token:.3f} secs")
                 yield f"data: {json.dumps({'type': 'token', 'content': word + ' '})}\n\n"
                 await asyncio.sleep(0.01)
 
@@ -2990,8 +3052,10 @@ async def medical_pipeline_api_stream(user_id: str, user_message: str, backgroun
         async for token_chunk in synthesize_answer_stream(rewritten, top4, gemini_llm):
             if token_count == 0:
                 # Calculate time from request start to when first token is yielded to client
-                time_to_first_token = time.perf_counter() - start_time
-                print(f"[STREAM] First token yielded to client! Time to first token (from request start): {time_to_first_token:.3f} secs")
+                # Always set this when we get the first token, even if it was set earlier (use the actual first token time)
+                if time_to_first_token is None:
+                    time_to_first_token = time.perf_counter() - start_time
+                    print(f"[STREAM] First token yielded to client! Time to first token (from request start): {time_to_first_token:.3f} secs")
             token_count += 1
             full_answer += token_chunk
             yield f"data: {json.dumps({'type': 'token', 'content': token_chunk})}\n\n"
@@ -3014,12 +3078,32 @@ async def medical_pipeline_api_stream(user_id: str, user_message: str, backgroun
 
         # Send metadata
         total_time = time.perf_counter() - start_time
+        
+        # Ensure time_to_first_token is always set (fallback to preprocessing_time if somehow not set)
+        if time_to_first_token is None:
+            time_to_first_token = preprocessing_time
+            print(f"[STREAM] WARNING: time_to_first_token was None, using preprocessing_time: {time_to_first_token:.3f} secs")
+        
+        # Explicitly ensure it's a number, not None
+        time_to_first_token_value = round(time_to_first_token, 3) if time_to_first_token is not None else round(preprocessing_time, 3)
+        
         print(f"[STREAM] Streaming completed! Total time: {total_time:.3f} secs")
         print(f"[STREAM] Preprocessing: {preprocessing_time:.3f} secs, Streaming: {total_time - preprocessing_time:.3f} secs")
+        print(f"[STREAM] Time to first token: {time_to_first_token_value:.3f} secs")
+        print(f"[STREAM] DEBUG: time_to_first_token variable value: {time_to_first_token}, rounded: {time_to_first_token_value}")
         timer.total("request")
         print(f"{'='*80}\n")
         
-        yield f"data: {json.dumps({'type': 'metadata', 'intent': 'answer', 'video_url': video_url, 'total_time': round(total_time, 3)})}\n\n"
+        # Build metadata dict explicitly to ensure all fields are included
+        metadata_dict = {
+            'type': 'metadata',
+            'intent': 'answer',
+            'video_url': video_url,
+            'time_to_first_token': time_to_first_token_value,
+            'total_time': round(total_time, 3)
+        }
+        print(f"[STREAM] DEBUG: Metadata dict before JSON: {metadata_dict}")
+        yield f"data: {json.dumps(metadata_dict)}\n\n"
         yield "data: [DONE]\n\n"
 
     except Exception as e:
