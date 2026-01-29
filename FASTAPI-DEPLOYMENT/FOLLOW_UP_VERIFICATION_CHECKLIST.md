@@ -1332,10 +1332,292 @@ def safe_json_parse(text):
     except Exception:
         return None
 
-# -------------------- HYBRID RETRIEVAL (vector -> bm25 -> cross -> fusion) --------------------
-def hybrid_retrieve(query: str, top_k_vec: int = 10, u_cap: int = 7) -> List[Dict[str, Any]]:
+# -------------------- FOLLOW-UP QUESTION PROMPTS --------------------
+followup_topic_extraction_prompt = PromptTemplate(
+    input_variables=["answer_text", "followup_chunk_1", "followup_chunk_2"],
+    template="""
+Return JSON only:
+{{
+  "answer_analysis": {{
+    "main_topic": "primary medical condition/topic",
+    "sub_topics": ["aspect1", "aspect2", "aspect3"]
+  }},
+  "followup_analysis": [
+    {{
+      "chunk_id": 1,
+      "main_topic": "medical condition",
+      "sub_topics": ["aspect1", "aspect2"],
+      "novel_aspects": ["new aspects not in answer"],
+      "relevance": "strong|weak|unrelated"
+    }},
+    {{
+      "chunk_id": 2,
+      "main_topic": "medical condition",
+      "sub_topics": ["aspect1"],
+      "novel_aspects": ["new aspects"],
+      "relevance": "strong|weak|unrelated"
+    }}
+  ],
+  "recommendation": {{
+    "has_followup": true/false,
+    "suggested_chunk": 1 or 2,
+    "followup_aspect": "specific aspect to ask about"
+  }}
+}}
+
+TASK: Analyze the provided answer and follow-up chunks. Extract:
+1. Main topic and sub-topics covered in the answer
+2. Main topic and sub-topics in each follow-up chunk
+3. Which aspects are NEW (not in answer)
+4. Relevance rating for each follow-up chunk
+
+RULES:
+- Main topic: The primary medical condition/concept (e.g., "jaundice", "newborn feeding")
+- Sub-topics: Specific aspects covered (e.g., "definition", "symptoms", "treatment", "prevention")
+- Novel aspects: Topics in follow-up chunks NOT covered in the answer
+- Relevance ratings:
+  * strong: Same main topic + novel sub-topics = good follow-up candidate
+  * weak: Related topic or overlapping content = not ideal
+  * unrelated: Different main topic = skip this chunk
+
+Examples:
+- Answer covers: "Jaundice definition and symptoms"
+  Chunk 1 covers: "Jaundice treatment and prevention"
+  → strong match (same topic, novel aspects)
+  
+- Answer covers: "Jaundice definition, symptoms, causes, treatment"
+  Chunk 1 covers: "More about jaundice symptoms"
+  → weak match (already covered)
+  
+- Answer covers: "Jaundice"
+  Chunk 1 covers: "Fever causes"
+  → unrelated (different topic)
+
+Select the chunk with STRONGEST relevance and most NOVEL content for follow-up.
+
+ANSWER TEXT:
+{answer_text}
+
+FOLLOW-UP CHUNK 1:
+{followup_chunk_1}
+
+FOLLOW-UP CHUNK 2:
+{followup_chunk_2}
+"""
+)
+
+followup_question_generation_prompt = PromptTemplate(
+    input_variables=["main_topic", "followup_aspect", "answer_context"],
+    template="""
+Generate ONE follow-up question based on the provided context.
+
+Context:
+- Main topic being discussed: {main_topic}
+- Answer covered: {answer_context}
+- New information available: {followup_aspect}
+
+RULES:
+1. Format: Always start with "Would you like to know about"
+2. Be specific: Name the exact aspect being offered
+3. Natural flow: Link to the main topic discussed
+4. Professional tone: Medical assistant style
+5. No extra explanation: ONLY the question, nothing else
+
+EXAMPLES:
+✅ "Would you like to know about treatment options for jaundice?"
+✅ "Would you like to know about prevention of newborn jaundice?"
+✅ "Would you like to know about complications if jaundice is not treated?"
+✅ "Would you like to know about when to seek medical help for {main_topic}?"
+
+❌ "Would you like more information?" (too vague)
+❌ "We have other topics." (not specific)
+❌ "Do you want to know?" (incomplete)
+
+Generate EXACTLY ONE follow-up question following the format above.
+Output: Just the question, no other text.
+"""
+)
+
+followup_nocontext_suggestion_prompt = PromptTemplate(
+    input_variables=["original_query", "available_topics"],
+    template="""
+Suggest an alternative, related medical topic when the user's query couldn't be answered.
+
+User asked about: {original_query}
+Available related topics in documents: {available_topics}
+
+TASK: Suggest ONE related topic that IS available, to help redirect the user helpfully.
+
+RULES:
+1. Format: "I don't have information about that, but would you like to know about <topic> instead?"
+2. Choose a RELATED topic (not random)
+3. Professional and helpful tone
+4. Acknowledge the limitation gracefully
+5. Offer concrete alternative
+
+EXAMPLE:
+- User: "Tell me about alien pregnancy complications"
+- Available: jaundice, newborn care, breastfeeding
+- Response: "I don't have information about that, but would you like to know about common newborn complications like jaundice instead?"
+
+Generate EXACTLY ONE helpful suggestion following the format above.
+Output: Just the suggestion sentence.
+"""
+)
+
+# -------------------- FOLLOW-UP EXTRACTION FUNCTION --------------------
+async def extract_followup_info(answer_text: str, followup_chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Returns re-ranked candidate chunks using vector + BM25 + cross-encoder.
+    Extract follow-up question from chunks asynchronously.
+    Called AFTER first token is streamed (non-blocking).
+    
+    Args:
+        answer_text: The generated answer
+        followup_chunks: Candidate chunks for follow-up (list of 1-2 chunks)
+    
+    Returns:
+        Dict with:
+        {
+          "follow_up": "Would you like to know about...?" or None,
+          "reasoning": "why this was/wasn't chosen"
+        }
+    """
+    print("[FOLLOWUP] Starting async follow-up extraction...")
+    
+    try:
+        # Edge case: no follow-up chunks
+        if not followup_chunks:
+            print("[FOLLOWUP] No follow-up chunks available")
+            return {"follow_up": None, "reasoning": "no_candidates"}
+        
+        # Edge case: only 1 follow-up chunk
+        if len(followup_chunks) == 1:
+            followup_chunk_1 = followup_chunks[0].get("text", "")[:500]
+            followup_chunk_2 = ""
+        else:
+            followup_chunk_1 = followup_chunks[0].get("text", "")[:500]
+            followup_chunk_2 = followup_chunks[1].get("text", "")[:500]
+        
+        # Truncate answer for prompt (avoid token overflow)
+        answer_text_truncated = answer_text[:1000]
+        
+        # Step 1: Extract topics from answer and follow-up chunks
+        print("[FOLLOWUP] Step 1: Extracting topics with Gemini...")
+        extract_prompt = followup_topic_extraction_prompt.format(
+            answer_text=answer_text_truncated,
+            followup_chunk_1=followup_chunk_1,
+            followup_chunk_2=followup_chunk_2
+        )
+        
+        extraction_response = gemini_llm.invoke([HumanMessage(content=extract_prompt)])
+        extraction_result = safe_json_parse(extraction_response.content)
+        
+        if not extraction_result:
+            print("[FOLLOWUP] Failed to parse extraction response")
+            return {"follow_up": None, "reasoning": "extraction_failed"}
+        
+        print(f"[FOLLOWUP] Extraction result: {extraction_result}")
+        
+        # Step 2: Check recommendation
+        recommendation = extraction_result.get("recommendation", {})
+        has_followup = recommendation.get("has_followup", False)
+        
+        if not has_followup:
+            print("[FOLLOWUP] No follow-up recommended (already covered or unrelated)")
+            return {"follow_up": None, "reasoning": "no_novel_content"}
+        
+        # Step 3: Generate follow-up question
+        suggested_chunk_id = recommendation.get("suggested_chunk", 1)
+        followup_aspect = recommendation.get("followup_aspect", "")
+        main_topic = extraction_result.get("answer_analysis", {}).get("main_topic", "")
+        answer_context = ", ".join(extraction_result.get("answer_analysis", {}).get("sub_topics", []))
+        
+        if not followup_aspect or not main_topic:
+            print("[FOLLOWUP] Missing followup_aspect or main_topic")
+            return {"follow_up": None, "reasoning": "incomplete_extraction"}
+        
+        print(f"[FOLLOWUP] Step 2: Generating follow-up question for aspect: {followup_aspect}")
+        question_prompt = followup_question_generation_prompt.format(
+            main_topic=main_topic,
+            followup_aspect=followup_aspect,
+            answer_context=answer_context
+        )
+        
+        question_response = gemini_llm.invoke([HumanMessage(content=question_prompt)])
+        followup_question = question_response.content.strip()
+        
+        # Validate question format
+        if not followup_question.lower().startswith("would you like to know"):
+            print(f"[FOLLOWUP] WARNING: Question doesn't match expected format: {followup_question[:100]}")
+            # Still use it but log the warning
+        
+        print(f"[FOLLOWUP] ✓ Follow-up generated: {followup_question[:80]}...")
+        return {
+            "follow_up": followup_question,
+            "reasoning": "generated",
+            "main_topic": main_topic,
+            "aspect": followup_aspect
+        }
+        
+    except Exception as e:
+        print(f"[FOLLOWUP] ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"follow_up": None, "reasoning": f"error: {str(e)[:50]}"}
+
+
+async def extract_followup_for_nocontext(followup_chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Generate follow-up suggestion when there's no direct answer (no_context case).
+    
+    Args:
+        followup_chunks: Available chunks to suggest from
+    
+    Returns:
+        Dict with follow-up suggestion
+    """
+    print("[FOLLOWUP_NOCONTEXT] Generating alternative topic suggestion...")
+    
+    try:
+        if not followup_chunks:
+            print("[FOLLOWUP_NOCONTEXT] No chunks available")
+            return {"follow_up": None}
+        
+        # Extract topics from available chunks
+        available_topics = []
+        for chunk in followup_chunks:
+            chunk_text = chunk.get("text", "")[:300]
+            available_topics.append(chunk_text)
+        
+        available_topics_str = " | ".join(available_topics)
+        
+        suggestion_prompt = followup_nocontext_suggestion_prompt.format(
+            original_query="(user's query)",
+            available_topics=available_topics_str
+        )
+        
+        suggestion_response = gemini_llm.invoke([HumanMessage(content=suggestion_prompt)])
+        followup_suggestion = suggestion_response.content.strip()
+        
+        print(f"[FOLLOWUP_NOCONTEXT] ✓ Suggestion generated: {followup_suggestion[:80]}...")
+        return {
+            "follow_up": followup_suggestion,
+            "reasoning": "alternative_topic"
+        }
+        
+    except Exception as e:
+        print(f"[FOLLOWUP_NOCONTEXT] ERROR: {e}")
+        return {"follow_up": None}
+
+# -------------------- HYBRID RETRIEVAL (vector -> bm25 -> cross -> fusion) --------------------
+def hybrid_retrieve(query: str, top_k_vec: int = 10, u_cap: int = 7) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Returns re-ranked candidate chunks split for answer and follow-up.
+    
+    Returns:
+        Tuple[answer_chunks, followup_chunks]
+        - answer_chunks: Top 4 ranked chunks for answer generation
+        - followup_chunks: Next 2 ranked chunks for follow-up questions (or fewer if <6 total)
     """
     print("="*60)
     print("HYBRID RETRIEVAL BLOCK BREAKDOWN")
@@ -1504,13 +1786,24 @@ def hybrid_retrieve(query: str, top_k_vec: int = 10, u_cap: int = 7) -> List[Dic
     timer.mark("sort_candidates")
     print(f"[HYBRID] sort_candidates took {timer.last - timer.start:.3f}s")
     
+    # 7) SPLIT FOR ANSWER vs FOLLOW-UP
+    # Answer: top 4 chunks, FollowUp: next 2 chunks
+    answer_count = min(4, len(candidates))
+    followup_count = max(0, len(candidates) - answer_count)
+    followup_count = min(2, followup_count)  # Take only next 2 for follow-up
+    
+    answer_chunks = candidates[:answer_count]
+    followup_chunks = candidates[answer_count:answer_count + followup_count]
+    
+    print(f"[HYBRID] SPLIT: {len(answer_chunks)} for answer, {len(followup_chunks)} for follow-up")
+    
     # FINAL SUMMARY
     total_time = timer.total("hybrid_retrieve")
     print(f"[HYBRID] TOTAL HYBRID RETRIEVAL TIME: {total_time:.3f}s")
-    print(f"[HYBRID] Returning {len(candidates)} ranked candidates")
+    print(f"[HYBRID] Returning {len(answer_chunks)} answer chunks + {len(followup_chunks)} follow-up chunks")
     print("="*60)
     
-    return candidates
+    return answer_chunks, followup_chunks
 
 # -------------------- BERT FILTER + ANSWER --------------------
 def bert_filter_candidates(candidates: List[Dict[str, Any]], sample_answer: str, original_query: str, min_score: float = 0.35) -> List[Dict[str, Any]]:
@@ -2777,33 +3070,49 @@ async def medical_pipeline_api(user_id: str, user_message: str, background_tasks
         total_time = t_end - start_time
         timer.total("request")
         print(f"total took {total_time:.2f} secs")
-        return {"answer": reply, "intent": "chitchat", "follow_up": None, "time_to_first_token": round(preprocessing_time, 3), "total_time": round(total_time, 3)}
+        return {"answer": reply, "intent": "chitchat", "time_to_first_token": round(preprocessing_time, 3), "total_time": round(total_time, 3)}
 
     # Skip the old reformulation step since it's now combined above
 
     # ---- HYBRID RETRIEVAL ----
     print("[pipeline] Step 4: hybrid_retrieve")
-    candidates = hybrid_retrieve(rewritten)   # vector + bm25 + rerank
+    answer_chunks, followup_chunks = hybrid_retrieve(rewritten)   # vector + bm25 + rerank
     t4 = time.perf_counter()
     timer.mark("hybrid_retrieve")
     print(f"retrieval took {t4 - t3:.2f} secs")
-    print(f"[pipeline] retrieved {len(candidates)} candidates")
+    print(f"[pipeline] retrieved {len(answer_chunks)} answer chunks + {len(followup_chunks)} follow-up chunks")
 
     # Edge case: No candidates retrieved
-    if not candidates or len(candidates) == 0:
+    if not answer_chunks or len(answer_chunks) == 0:
         print("[pipeline] No candidates retrieved from hybrid_retrieve")
         msg = "Sorry I am not aware this topic, Please ask any other medical related terminologies"
         preprocessing_time = t4 - start_time  # Time until retrieval completes (no answer generated)
+
+        # Attempt to generate an alternative follow-up suggestion (synchronous for non-streaming)
+        followup_question = None
+        if followup_chunks:
+            try:
+                print("[pipeline] Generating follow-up suggestion for no-context (sync)...")
+                followup_result = await asyncio.wait_for(extract_followup_for_nocontext(followup_chunks), timeout=3.0)
+                followup_question = followup_result.get("follow_up") if followup_result else None
+                if followup_question:
+                    print(f"[pipeline] Appending follow-up suggestion to no-context msg: {followup_question[:120]}...")
+                    msg = msg + "\n\n" + followup_question
+            except asyncio.TimeoutError:
+                print("[pipeline] Follow-up suggestion generation timed out (no-context)")
+            except Exception as e:
+                print(f"[pipeline] ERROR generating follow-up suggestion (no-context): {e}")
+
         background_tasks.add_task(_background_update_and_save, user_id, user_message, msg, "no_context", history_pairs, current_summary)
         t_end = time.perf_counter()
         total_time = t_end - start_time
         timer.total("request")
         print(f"total took {total_time:.2f} secs")
-        return {"answer": msg, "intent": "no_context", "follow_up": None, "video_url": None, "time_to_first_token": round(preprocessing_time, 3), "total_time": round(total_time, 3)}
+        return {"answer": msg, "intent": "no_context", "video_url": None, "time_to_first_token": round(preprocessing_time, 3), "total_time": round(total_time, 3)}
 
     print("[pipeline] Step 5: bert_filter_candidates")
     # Use sample_answer for better semantic matching (answer-to-answer comparison)
-    filtered = bert_filter_candidates(candidates, sample_answer, rewritten, min_score=0.35)
+    filtered = bert_filter_candidates(answer_chunks, sample_answer, rewritten, min_score=0.35)
     t5 = time.perf_counter()
     timer.mark("bert_filter_candidates")
     print(f"BERT filtering took {t5 - t4:.2f} secs")
@@ -2838,6 +3147,21 @@ async def medical_pipeline_api(user_id: str, user_message: str, background_tasks
             else:
                 print("[pipeline] No relevant video found")
         
+        # Attempt to generate follow-up (synchronous for non-streaming) and append to answer
+        followup_question = None
+        if followup_chunks:
+            try:
+                print("[pipeline] Generating follow-up (sync) to append to answer...")
+                followup_result = await asyncio.wait_for(extract_followup_info(answer, followup_chunks), timeout=3.0)
+                followup_question = followup_result.get("follow_up") if followup_result else None
+                if followup_question:
+                    print(f"[pipeline] Appending follow-up to answer: {followup_question[:120]}...")
+                    answer = answer + "\n\n" + followup_question
+            except asyncio.TimeoutError:
+                print("[pipeline] Follow-up generation timed out (answer)")
+            except Exception as e:
+                print(f"[pipeline] ERROR generating follow-up (answer): {e}")
+
         # Schedule full update+save in background (do not run update_chat_history in request path)
         print("[pipeline] schedule background save: answer")
         background_tasks.add_task(_background_update_and_save, user_id, user_message, answer, "answer", history_pairs, current_summary)
@@ -2848,12 +3172,9 @@ async def medical_pipeline_api(user_id: str, user_message: str, background_tasks
         print(f"total took {total_time:.2f} secs")
         print(f"time to first token (preprocessing): {time_to_first_token:.2f} secs")
         
-        # Return response with video URL
+        # Return response with video URL (follow-up has been appended to `answer` if present)
         response = {"answer": answer, "intent": "answer", "time_to_first_token": round(time_to_first_token, 3), "total_time": round(total_time, 3)}
-        if video_url:
-            response["video_url"] = video_url
-        else:
-            response["video_url"] = None
+        response["video_url"] = video_url if video_url else None
         
         return response
 
@@ -2862,6 +3183,21 @@ async def medical_pipeline_api(user_id: str, user_message: str, background_tasks
         print("[pipeline] No qualified chunks found (all candidates below threshold or empty)")
         msg = "Sorry I am not aware this topic, Please ask any other medical related terminologies"
         preprocessing_time = t5 - start_time  # Time until filtering completes (no answer generated)
+        # Attempt to generate follow-up suggestion and append to message (non-streaming)
+        followup_question = None
+        if 'followup_chunks' in locals() and followup_chunks:
+            try:
+                print("[pipeline] Generating follow-up suggestion for no-qualified-chunks (sync)...")
+                followup_result = await asyncio.wait_for(extract_followup_for_nocontext(followup_chunks), timeout=3.0)
+                followup_question = followup_result.get("follow_up") if followup_result else None
+                if followup_question:
+                    print(f"[pipeline] Appending follow-up suggestion to msg: {followup_question[:120]}...")
+                    msg = msg + "\n\n" + followup_question
+            except asyncio.TimeoutError:
+                print("[pipeline] Follow-up suggestion generation timed out (no-qualified-chunks)")
+            except Exception as e:
+                print(f"[pipeline] ERROR generating follow-up suggestion (no-qualified-chunks): {e}")
+
         # Schedule full update+save in background for no_context
         print("[pipeline] schedule background save: no_context")
         background_tasks.add_task(_background_update_and_save, user_id, user_message, msg, "no_context", history_pairs, current_summary)
@@ -2870,9 +3206,9 @@ async def medical_pipeline_api(user_id: str, user_message: str, background_tasks
         total_time = t_end - start_time
         timer.total("request")
         print(f"total took {total_time:.2f} secs")
-        
+
         # Return response with video URL (None for no_context)
-        return {"answer": msg, "intent": "no_context", "follow_up": None, "video_url": None, "time_to_first_token": round(preprocessing_time, 3), "total_time": round(total_time, 3)}
+        return {"answer": msg, "intent": "no_context", "video_url": None, "time_to_first_token": round(preprocessing_time, 3), "total_time": round(total_time, 3)}
 
 async def medical_pipeline_api_stream(user_id: str, user_message: str, background_tasks: BackgroundTasks):
     """
@@ -2905,6 +3241,7 @@ async def medical_pipeline_api_stream(user_id: str, user_message: str, backgroun
             chat_history_context_for_llm, user_message, last_3_qa_pairs
         )
         t3 = time.perf_counter()
+        print(f"[STREAM] Reformulated question: {rewritten}")
         timer.mark("classify_and_reformulate")
         print(f"[STREAM] classify_and_reformulate took {t3 - t2:.3f} secs")
 
@@ -2949,13 +3286,14 @@ async def medical_pipeline_api_stream(user_id: str, user_message: str, backgroun
         # Hybrid retrieval
         print(f"[STREAM] Starting hybrid retrieval...")
         retrieval_start = time.perf_counter()
-        candidates = hybrid_retrieve(rewritten)
+        answer_chunks, followup_chunks = hybrid_retrieve(rewritten)
         retrieval_end = time.perf_counter()
         timer.mark("hybrid_retrieve")
         print(f"[STREAM] hybrid_retrieve took {retrieval_end - retrieval_start:.3f} secs")
-        print(f"[STREAM] Retrieved {len(candidates)} candidates")
+        print(f"[STREAM] Retrieved {len(answer_chunks)} answer chunks + {len(followup_chunks)} follow-up chunks")
         
-        if not candidates:
+        # If no answer chunks, handle no-context case
+        if not answer_chunks:
             msg = "I apologize, but I do not have sufficient information in my documents to answer this question accurately."
             # Stream no_context message word by word
             words = msg.split()
@@ -2973,23 +3311,47 @@ async def medical_pipeline_api_stream(user_id: str, user_message: str, backgroun
                 time_to_first_token = t3 - start_time  # Use time after preprocessing
             time_to_first_token_value = round(time_to_first_token, 3) if time_to_first_token is not None else round(t3 - start_time, 3)
             
+            # Async follow-up generation for no-context (non-blocking)
+            followup_task = None
+            if followup_chunks:
+                followup_task = asyncio.create_task(extract_followup_for_nocontext(followup_chunks))
+
+            # Wait for follow-up if it exists, stream it and append to msg
+            followup_question = None
+            if followup_task:
+                try:
+                    followup_result = await asyncio.wait_for(followup_task, timeout=3.0)
+                    followup_question = followup_result.get("follow_up") if followup_result else None
+                    if followup_question:
+                        print(f"[STREAM] Streaming follow-up suggestion (no-context): {followup_question[:120]}...")
+                        # Stream follow-up as a single token event (one chunk)
+                        yield f"data: {json.dumps({'type': 'token', 'content': followup_question})}\n\n"
+                        await asyncio.sleep(0.01)
+                        # Append to saved message
+                        msg = msg + "\n\n" + followup_question
+                except asyncio.TimeoutError:
+                    print("[STREAM] Follow-up generation timed out")
+                except Exception as e:
+                    print(f"[STREAM] ERROR generating follow-up (no-context): {e}")
+
+            # Save updated msg (with appended follow-up if any)
+            background_tasks.add_task(_background_update_and_save, user_id, user_message, msg, "no_context", history_pairs, current_summary)
+
             metadata_dict = {
                 'type': 'metadata',
                 'intent': 'no_context',
-                'follow_up': None,
                 'video_url': None,
                 'time_to_first_token': time_to_first_token_value,
                 'total_time': round(total_time, 3)
             }
-            background_tasks.add_task(_background_update_and_save, user_id, user_message, msg, "no_context", history_pairs, current_summary)
             yield f"data: {json.dumps(metadata_dict)}\n\n"
             yield "data: [DONE]\n\n"
             return
 
-        # Filter candidates
-        print(f"[STREAM] Starting BERT filter...")
+        # Filter candidates (answer chunks only)
+        print(f"[STREAM] Starting BERT filter on {len(answer_chunks)} answer chunks...")
         filter_start = time.perf_counter()
-        filtered = bert_filter_candidates(candidates, sample_answer, rewritten, min_score=0.35)
+        filtered = bert_filter_candidates(answer_chunks, sample_answer, rewritten, min_score=0.35)
         filter_end = time.perf_counter()
         timer.mark("bert_filter_candidates")
         print(f"[STREAM] bert_filter_candidates took {filter_end - filter_start:.3f} secs")
@@ -3014,15 +3376,38 @@ async def medical_pipeline_api_stream(user_id: str, user_message: str, backgroun
                 time_to_first_token = filter_end - start_time
             time_to_first_token_value = round(time_to_first_token, 3) if time_to_first_token is not None else round(filter_end - start_time, 3)
             
+            # Async follow-up generation for no-context (non-blocking)
+            followup_task = None
+            if followup_chunks:
+                followup_task = asyncio.create_task(extract_followup_for_nocontext(followup_chunks))
+
+            # Wait for follow-up if it exists, stream it and append to msg
+            followup_question = None
+            if followup_task:
+                try:
+                    followup_result = await asyncio.wait_for(followup_task, timeout=3.0)
+                    followup_question = followup_result.get("follow_up") if followup_result else None
+                    if followup_question:
+                        print(f"[STREAM] Streaming follow-up suggestion (no-context): {followup_question[:120]}...")
+                        # Stream follow-up as a single token event (one chunk)
+                        yield f"data: {json.dumps({'type': 'token', 'content': followup_question})}\n\n"
+                        await asyncio.sleep(0.01)
+                        msg = msg + "\n\n" + followup_question
+                except asyncio.TimeoutError:
+                    print("[STREAM] Follow-up generation timed out")
+                except Exception as e:
+                    print(f"[STREAM] ERROR generating follow-up (no-context): {e}")
+
+            # Save updated msg (with appended follow-up if any)
+            background_tasks.add_task(_background_update_and_save, user_id, user_message, msg, "no_context", history_pairs, current_summary)
+
             metadata_dict = {
                 'type': 'metadata',
                 'intent': 'no_context',
-                'follow_up': None,
                 'video_url': None,
                 'time_to_first_token': time_to_first_token_value,
                 'total_time': round(total_time, 3)
             }
-            background_tasks.add_task(_background_update_and_save, user_id, user_message, msg, "no_context", history_pairs, current_summary)
             yield f"data: {json.dumps(metadata_dict)}\n\n"
             yield "data: [DONE]\n\n"
             return
@@ -3049,16 +3434,34 @@ async def medical_pipeline_api_stream(user_id: str, user_message: str, backgroun
         token_count = 0
         
         full_answer = ""
+        followup_task = None  # Will be launched after first token
+        
         async for token_chunk in synthesize_answer_stream(rewritten, top4, gemini_llm):
             if token_count == 0:
                 # Calculate time from request start to when first token is yielded to client
-                # Always set this when we get the first token, even if it was set earlier (use the actual first token time)
                 if time_to_first_token is None:
                     time_to_first_token = time.perf_counter() - start_time
                     print(f"[STREAM] First token yielded to client! Time to first token (from request start): {time_to_first_token:.3f} secs")
-            token_count += 1
-            full_answer += token_chunk
-            yield f"data: {json.dumps({'type': 'token', 'content': token_chunk})}\n\n"
+                
+                # Emit first token
+                token_count += 1
+                full_answer += token_chunk
+                yield f"data: {json.dumps({'type': 'token', 'content': token_chunk})}\n\n"
+                
+                # Emit stream_start metadata to signal client that streaming has begun
+                yield f"data: {json.dumps({'type': 'stream_start', 'time_to_first_token': time_to_first_token})}\n\n"
+                print(f"[STREAM] Emitted stream_start metadata")
+                
+                # LAUNCH ASYNC FOLLOW-UP GENERATION (non-blocking)
+                # This happens while remaining tokens are being streamed
+                if followup_chunks:
+                    print(f"[STREAM] Launching async follow-up extraction (non-blocking)...")
+                    followup_task = asyncio.create_task(extract_followup_info("", followup_chunks))
+                    # Note: We pass empty string initially; could be improved to pass partial answer
+            else:
+                token_count += 1
+                full_answer += token_chunk
+                yield f"data: {json.dumps({'type': 'token', 'content': token_chunk})}\n\n"
         
         if token_count > 0:
             print(f"[STREAM] Streamed {token_count} token chunks")
@@ -3073,28 +3476,47 @@ async def medical_pipeline_api_stream(user_id: str, user_message: str, backgroun
         if video_system:
             video_url = video_system.find_relevant_video(full_answer)
 
-        # Schedule background save
-        background_tasks.add_task(_background_update_and_save, user_id, user_message, full_answer, "answer", history_pairs, current_summary)
-
-        # Send metadata
+        # Send metadata: first ensure time_to_first_token is set
         total_time = time.perf_counter() - start_time
-        
-        # Ensure time_to_first_token is always set (fallback to preprocessing_time if somehow not set)
+
         if time_to_first_token is None:
             time_to_first_token = preprocessing_time
             print(f"[STREAM] WARNING: time_to_first_token was None, using preprocessing_time: {time_to_first_token:.3f} secs")
-        
-        # Explicitly ensure it's a number, not None
+
         time_to_first_token_value = round(time_to_first_token, 3) if time_to_first_token is not None else round(preprocessing_time, 3)
-        
+
+        # Wait for follow-up task to complete (with timeout); if follow-up exists, stream it and append to `full_answer`
+        followup_question = None
+        if followup_task:
+            try:
+                print(f"[STREAM] Waiting for follow-up task to complete...")
+                followup_result = await asyncio.wait_for(followup_task, timeout=3.0)
+                followup_question = followup_result.get("follow_up")
+                if followup_question:
+                    print(f"[STREAM] ✓ Follow-up generated: {followup_question[:80]}...")
+                    # Stream the follow-up as a single token event (one chunk)
+                    yield f"data: {json.dumps({'type': 'token', 'content': followup_question})}\n\n"
+                    await asyncio.sleep(0.01)
+                    # Append follow-up to full_answer for saving
+                    full_answer = full_answer + "\n\n" + followup_question
+                else:
+                    print(f"[STREAM] No follow-up generated (already covered or no novel content)")
+            except asyncio.TimeoutError:
+                print(f"[STREAM] WARNING: Follow-up task timed out")
+            except Exception as e:
+                print(f"[STREAM] ERROR waiting for follow-up: {e}")
+
         print(f"[STREAM] Streaming completed! Total time: {total_time:.3f} secs")
         print(f"[STREAM] Preprocessing: {preprocessing_time:.3f} secs, Streaming: {total_time - preprocessing_time:.3f} secs")
         print(f"[STREAM] Time to first token: {time_to_first_token_value:.3f} secs")
         print(f"[STREAM] DEBUG: time_to_first_token variable value: {time_to_first_token}, rounded: {time_to_first_token_value}")
         timer.total("request")
         print(f"{'='*80}\n")
-        
-        # Build metadata dict explicitly to ensure all fields are included
+
+        # Schedule background save now that full_answer contains appended follow-up (if any)
+        background_tasks.add_task(_background_update_and_save, user_id, user_message, full_answer, "answer", history_pairs, current_summary)
+
+        # Build metadata dict explicitly to ensure all fields are included (no separate follow_up field)
         metadata_dict = {
             'type': 'metadata',
             'intent': 'answer',
